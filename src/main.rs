@@ -4,13 +4,13 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const VERSION: &str = "0.0.1-alpha.2";
 
-const COLOR_OK: &str = "\x1b[32;1m";   // bright green
-const COLOR_BAD: &str = "\x1b[31;1m";  // bright red
+const COLOR_OK: &str = "\x1b[32;1m";
+const COLOR_BAD: &str = "\x1b[31;1m";
 const COLOR_RESET: &str = "\x1b[0m";
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -80,13 +80,23 @@ struct Cli {
 
 fn ensure_parent_dir(dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create parent dir: {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create parent dir: {}", parent.display()))?;
     }
     Ok(())
 }
 
 fn file_name_of(p: &Path) -> Result<&OsStr> {
-    p.file_name().ok_or_else(|| anyhow!("cannot determine filename for {}", p.display()))
+    p.file_name()
+        .ok_or_else(|| anyhow!("cannot determine filename for {}", p.display()))
+}
+
+fn is_dir(p: &Path) -> bool {
+    fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+fn is_file(p: &Path) -> bool {
+    fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
 }
 
 fn hash_file(path: &Path, alg: HashAlg) -> Result<String> {
@@ -171,17 +181,16 @@ fn hash_file(path: &Path, alg: HashAlg) -> Result<String> {
                 if n == 0 { break; }
                 hasher.update(&buf[..n]);
             }
-            let v = hasher.digest();
-            Ok(format!("{:016x}", v))
+            Ok(format!("{:016x}", hasher.digest()))
         }
     }
 }
 
-fn print_verify(ok: bool, name: &str, alg: HashAlg) {
+fn print_verify(ok: bool, label: &str, alg: HashAlg) {
     if ok {
-        println!("{COLOR_OK}{} {} SRC ≙ DEST{COLOR_RESET}", name, alg.as_str());
+        println!("{COLOR_OK}{label} {} SRC ≙ DEST{COLOR_RESET}", alg.as_str());
     } else {
-        println!("{COLOR_BAD}{} {} SRC ≠ DEST{COLOR_RESET}", name, alg.as_str());
+        println!("{COLOR_BAD}{label} {} SRC ≠ DEST{COLOR_RESET}", alg.as_str());
     }
 }
 
@@ -192,9 +201,9 @@ fn copy_symlink(src: &Path, dst: &Path, cli: &Cli) -> Result<()> {
     ensure_parent_dir(dst)?;
     let target = fs::read_link(src).with_context(|| format!("read symlink: {}", src.display()))?;
 
-    // Replace existing dst if needed
     let _ = fs::remove_file(dst);
-    unixfs::symlink(&target, dst).with_context(|| format!("create symlink: {} -> {}", dst.display(), target.display()))?;
+    unixfs::symlink(&target, dst)
+        .with_context(|| format!("create symlink: {} -> {}", dst.display(), target.display()))?;
 
     if !cli.no_hash {
         let dst_target = fs::read_link(dst).with_context(|| format!("read symlink: {}", dst.display()))?;
@@ -204,6 +213,7 @@ fn copy_symlink(src: &Path, dst: &Path, cli: &Cli) -> Result<()> {
             return Err(anyhow!("symlink target mismatch: {} -> {:?} vs {:?}", src.display(), target, dst_target));
         }
     }
+
     Ok(())
 }
 
@@ -220,6 +230,7 @@ fn copy_regular_file(src: &Path, dst: &Path, cli: &Cli) -> Result<()> {
             return Err(anyhow!("hash mismatch: {} ({} != {})", src.display(), h1, h2));
         }
     }
+
     Ok(())
 }
 
@@ -230,21 +241,15 @@ fn copy_dir_recursive(src_dir: &Path, dst_dir: &Path, cli: &Cli) -> Result<()> {
         let entry = entry?;
         let src_path = entry.path();
         let meta = fs::symlink_metadata(&src_path).with_context(|| format!("stat: {}", src_path.display()))?;
-
-        let name = entry.file_name();
-        let dst_path = dst_dir.join(name);
+        let dst_path = dst_dir.join(entry.file_name());
 
         if meta.file_type().is_dir() {
             copy_dir_recursive(&src_path, &dst_path, cli)?;
         } else if meta.file_type().is_symlink() {
             #[cfg(unix)]
-            {
-                copy_symlink(&src_path, &dst_path, cli)?;
-            }
+            { copy_symlink(&src_path, &dst_path, cli)?; }
             #[cfg(not(unix))]
-            {
-                return Err(anyhow!("symlink not supported on this platform: {}", src_path.display()));
-            }
+            { return Err(anyhow!("symlink not supported on this platform: {}", src_path.display())); }
         } else if meta.file_type().is_file() {
             copy_regular_file(&src_path, &dst_path, cli)?;
         } else {
@@ -255,16 +260,17 @@ fn copy_dir_recursive(src_dir: &Path, dst_dir: &Path, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn is_dir(p: &Path) -> bool {
-    fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
-}
-
-fn is_file(p: &Path) -> bool {
-    fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
+fn compute_target_path_for_source(cli: &Cli, src: &Path, dest: &Path) -> Result<PathBuf> {
+    if cli.sources.len() > 1 || is_dir(dest) {
+        // dest is a directory => copy into it using source filename
+        Ok(dest.join(file_name_of(src)?))
+    } else {
+        // single source => dest is a file path (or not existing yet)
+        Ok(dest.to_path_buf())
+    }
 }
 
 fn run(cli: Cli) -> Result<()> {
-    // Header requested
     println!("Mighty Copy with Hash Version {}", VERSION);
     println!("Copyright (C) 2026 Olize");
     println!("PS.: Life is short. Time is small. Take it easy and fuck it all!");
@@ -276,89 +282,72 @@ fn run(cli: Cli) -> Result<()> {
 
     let dest = PathBuf::from(&cli.destination);
 
-    // Multiple sources => dest must be directory
+    // Multiple sources => dest must be dir
     if cli.sources.len() > 1 {
         fs::create_dir_all(&dest).with_context(|| format!("create destination dir: {}", dest.display()))?;
         if !is_dir(&dest) {
             return Err(anyhow!("destination must be a directory when multiple sources are provided: {}", dest.display()));
         }
-    } else {
-        // Single source: if dest doesn't exist but ends with / treat as dir create
-        if cli.destination.ends_with('/') {
-            fs::create_dir_all(&dest).with_context(|| format!("create destination dir: {}", dest.display()))?;
-        }
+    } else if cli.destination.ends_with("/") {
+        fs::create_dir_all(&dest).with_context(|| format!("create destination dir: {}", dest.display()))?;
     }
 
-    // Copy each source
-    let mut copied_any = false;
+    let mut did_anything = false;
 
     for src_s in &cli.sources {
         let src = PathBuf::from(src_s);
         let meta = fs::symlink_metadata(&src).with_context(|| format!("stat source: {}", src.display()))?;
 
+        // Decide top-level destination for this source
         if meta.file_type().is_symlink() {
-            // symlink source
-            let target_dst = if is_dir(&dest) || cli.sources.len() > 1 {
-                dest.join(file_name_of(&src)?)
-            } else {
-                dest.clone()
-            };
+            let target_dst = compute_target_path_for_source(&cli, &src, &dest)?;
             #[cfg(unix)]
-            {
-                copy_symlink(&src, &target_dst, &cli)?;
-            }
+            { copy_symlink(&src, &target_dst, &cli)?; }
             #[cfg(not(unix))]
-            {
-                return Err(anyhow!("symlink not supported on this platform: {}", src.display()));
-            }
-            copied_any = true;
+            { return Err(anyhow!("symlink not supported on this platform: {}", src.display())); }
 
+            did_anything = true;
             if cli.move_mode {
                 fs::remove_file(&src).with_context(|| format!("remove source symlink: {}", src.display()))?;
             }
-            continue;
-        }
-
-        if meta.is_file() {
-            let target_dst = if is_dir(&dest) || cli.sources.len() > 1 {
-                dest.join(file_name_of(&src)?)
-            } else {
-                dest.clone()
-            };
-
+        } else if meta.file_type().is_file() {
+            let target_dst = compute_target_path_for_source(&cli, &src, &dest)?;
             copy_regular_file(&src, &target_dst, &cli)?;
-            copied_any = true;
-
+            did_anything = true;
             if cli.move_mode {
                 fs::remove_file(&src).with_context(|| format!("remove source file: {}", src.display()))?;
             }
-        } else if meta.is_dir() {
-            // For directories: determine destination root
-            if is_file(&dest) {
-                return Err(anyhow!("cannot copy a directory into a file destination: {}", dest.display()));
-            }
-
-            let root_dst = if cli.only_src_content {
-                // copy contents into dest directly
+        } else if meta.file_type().is_dir() {
+            if cli.only_src_content {
+                // copy content of dir into dest
                 fs::create_dir_all(&dest).with_context(|| format!("create destination dir: {}", dest.display()))?;
-                dest.clone()
+                if !is_dir(&dest) {
+                    return Err(anyhow!("destination must be a directory when using -O: {}", dest.display()));
+                }
+                copy_dir_recursive(&src, &dest, &cli)?;
+                did_anything = true;
+                if cli.move_mode {
+                    fs::remove_dir_all(&src).with_context(|| format!("remove source dir: {}", src.display()))?;
+                }
             } else {
+                // copy the folder itself into dest
                 fs::create_dir_all(&dest).with_context(|| format!("create destination dir: {}", dest.display()))?;
-                dest.join(file_name_of(&src)?)
-            };
-
-            copy_dir_recursive(&src, &root_dst, &cli)?;
-            copied_any = true;
-
-            if cli.move_mode {
-                fs::remove_dir_all(&src).with_context(|| format!("remove source dir: {}", src.display()))?;
+                if !is_dir(&dest) {
+                    return Err(anyhow!("destination must be a directory when copying a directory: {}", dest.display()));
+                }
+                let dst_dir = dest.join(file_name_of(&src)?);
+                copy_dir_recursive(&src, &dst_dir, &cli)?;
+                did_anything = true;
+                if cli.move_mode {
+                    fs::remove_dir_all(&src).with_context(|| format!("remove source dir: {}", src.display()))?;
+                }
             }
         } else {
-            return Err(anyhow!("unsupported source type: {}", src.display()));
+            return Err(anyhow!("unsupported file type: {}", src.display()));
         }
     }
 
-    if !copied_any {
+    if !did_anything {
         return Err(anyhow!("nothing copied"));
     }
 
@@ -368,7 +357,7 @@ fn run(cli: Cli) -> Result<()> {
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
-        eprintln!("Error: {:#}", e);
+        eprintln!("ERROR: {:#}", e);
         std::process::exit(2);
     }
 }
