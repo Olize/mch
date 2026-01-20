@@ -7,7 +7,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const VERSION: &str = "0.0.1-alpha.2";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const COLOR_OK: &str = "\x1b[32;1m";
 const COLOR_BAD: &str = "\x1b[31;1m";
@@ -44,11 +44,19 @@ impl HashAlg {
 #[command(
     name = "mch",
     disable_help_subcommand = true,
+    disable_version_flag = true,
     version = VERSION,
-    about = "Mighty Copy with Hash",
+    about = concat!("Mighty Copy with Hash
+Copyright (C) 2026 Olize
+", env!("CARGO_PKG_VERSION")),
     long_about = None
 )]
 struct Cli {
+    /// Print version information (custom header)
+    #[arg(short = 'v', long = "version")]
+    version: bool,
+    /// Print version information
+
     #[arg(short = 'm', long = "move")]
     move_mode: bool,
 
@@ -307,6 +315,14 @@ fn compute_target_path_for_source(cli: &Cli, src: &Path, dest: &Path) -> Result<
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // Custom version output for -v/--version
+    if cli.version {
+        println!("Mighty Copy with Hash");
+        println!("Copyright (C) 2026 Olize");
+        println!("{}", VERSION);
+        return Ok(());
+    }
+
     println!("Mighty Copy with Hash Version {}", VERSION);
     println!("Copyright (C) 2026 Olize");
     println!("PS.: Life is short. Time is small. Take it easy and fuck it all!");

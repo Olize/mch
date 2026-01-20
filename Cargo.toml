@@ -1,6 +1,6 @@
 [package]
 name = "mch"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.5"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Mighty Copy with Hash (mch) - copy/move with post-copy verification (default: BLAKE3)."
