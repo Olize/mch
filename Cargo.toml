@@ -1,0 +1,27 @@
+[package]
+name = "mch"
+version = "0.0.1-alpha.2"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Mighty Copy with Hash (mch) - copy/move with post-copy verification (default: BLAKE3)."
+repository = "https://github.com/Olize/mch"
+readme = "README.md"
+
+[dependencies]
+# For hashing (fast + crypto)
+blake3 = "1"
+sha2 = "0.10"
+sha3 = "0.10"
+blake2 = "0.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# CLI parsing + help/version
+clap = { version = "4", features = ["derive"] }
+
+# Progress UI
+indicatif = "0.17"
+
+# Errors
+anyhow = "1"
+
+hex = "0.4"
