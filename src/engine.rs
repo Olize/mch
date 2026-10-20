@@ -388,10 +388,21 @@ fn atomic_replace(stage: &Path, destination: &Path) -> Result<()> {
         if fs::symlink_metadata(destination).is_ok() {
             let backup = new_temp_path(destination)?;
             fs::rename(destination, &backup.0)?;
-            if let Err(error) = fs::rename(stage, destination) {
-                fs::rename(&backup.0, destination)
-                    .context("restoring existing destination after rename failure")?;
-                return Err(error.into());
+            if let Err(publish_error) = fs::rename(stage, destination) {
+                if let Err(restore_error) = fs::rename(&backup.0, destination) {
+                    // Never delete the only surviving copy of the old destination.
+                    // Leave the backup on disk for manual recovery and report its location.
+                    let recovery_path = backup.0.clone();
+                    std::mem::forget(backup);
+                    bail!(
+                        "failed to publish {}: {}; could not restore previous destination: {};                          ORIGINAL DATA RETAINED AT {} (manual recovery required)",
+                        destination.display(),
+                        publish_error,
+                        restore_error,
+                        recovery_path.display()
+                    );
+                }
+                return Err(publish_error.into());
             }
             return Ok(());
         }
