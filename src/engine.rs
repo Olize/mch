@@ -15,6 +15,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 enum Kind {
     Regular,
+    #[cfg_attr(not(unix), allow(dead_code))]
     Symlink,
 }
 
@@ -163,15 +164,17 @@ fn check_destination_file(source: &Path, destination: &Path, overwrite: bool) ->
                 destination.display()
             )
         }
-        Some(_) => {
+        Some(_)
             if fs::canonicalize(source)
-                .is_ok_and(|src| fs::canonicalize(destination).is_ok_and(|dst| src == dst))
-            {
-                bail!(
-                    "source and destination resolve to the same file: {}",
-                    source.display()
-                );
-            }
+                .is_ok_and(|src| fs::canonicalize(destination).is_ok_and(|dst| src == dst)) =>
+        {
+            bail!(
+                "source and destination resolve to the same file: {}",
+                source.display()
+            );
+        }
+        Some(_) =>
+        {
             #[cfg(unix)]
             if let (Ok(a), Ok(b)) = (fs::metadata(source), fs::metadata(destination)) {
                 use std::os::unix::fs::MetadataExt;
