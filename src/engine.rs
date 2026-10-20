@@ -56,6 +56,23 @@ fn absolute(path: &Path) -> Result<PathBuf> {
             Component::RootDir | Component::Prefix(_) => result.push(component.as_os_str()),
         }
     }
+    // macOS exposes /var, /tmp and /etc as system-managed symlinks into /private.
+    // Normalize ONLY these verified system roots; other symlink parents stay forbidden.
+    #[cfg(target_os = "macos")]
+    for (alias, physical) in [
+        ("/var", "/private/var"),
+        ("/tmp", "/private/tmp"),
+        ("/etc", "/private/etc"),
+    ] {
+        let alias = Path::new(alias);
+        let physical = Path::new(physical);
+        if result.starts_with(alias)
+            && fs::symlink_metadata(alias).is_ok_and(|meta| meta.file_type().is_symlink())
+            && fs::canonicalize(alias).ok().as_deref() == Some(physical)
+        {
+            return Ok(physical.join(result.strip_prefix(alias)?));
+        }
+    }
     Ok(result)
 }
 

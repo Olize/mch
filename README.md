@@ -95,7 +95,7 @@ When copying a directory **without** `-O`, the source directory name is always a
 - Symbolic links are preserved on Unix, but their *textual targets* are checked rather than hashing the objects they refer to. Windows symbolic-link copying is rejected.
 - Directory ownership, hard-link relationships, extended attributes, ACLs, creation times, and modification times are **not** preserved. Do not use MCH as a metadata-perfect backup.
 - Special files (devices, sockets, FIFOs) are not copied.
-- Destination paths whose existing parent components are symbolic links are rejected deliberately to avoid writing through an unexpected alias. Depending on your environment, use the real/canonical path instead.
+- Destination paths whose existing parent components are symbolic links are rejected deliberately to avoid writing through an unexpected alias. On macOS, the standard system-managed `/var`, `/tmp`, and `/etc` aliases into `/private` are normalized after verifying their expected targets; other symlink parents remain forbidden.
 - MCH does not protect against concurrent malicious filesystem mutation (TOCTOU), disk/controller faults below the filesystem, or corruption that occurs after verification.
 - Using `-N` disables post-copy integrity verification, including for moves.
 
@@ -125,5 +125,7 @@ PS.: Life is short. Time is small. Take it easy and fuck it all!
 ## Support
 
 If you find this project useful, you can support my open-source work:
+
+[![Liberapay](https://img.shields.io/badge/Liberapay-Support-F6C915?style=for-the-badge&logo=liberapay&logoColor=000000)](https://liberapay.com/Olize/)
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=000000)](https://buymeacoffee.com/Olize)

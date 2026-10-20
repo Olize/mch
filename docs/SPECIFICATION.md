@@ -40,7 +40,7 @@ Preflight errors must leave originals untouched. Failures in the copy phase reta
 - No durability guarantees on power loss; no explicit fsync.
 - No preservation guarantee for owner, ACL, xattrs, timestamps, sparse extents or hard-link relationships. Basic file permissions and newly created directory permissions are handled.
 - Unix symlinks are preserved as links; Windows symlink copying is unsupported.
-- Destination paths with preexisting symlink ancestors are refused intentionally.
+- Destination paths with preexisting symlink ancestors are refused intentionally, except verified macOS system roots `/var`, `/tmp` and `/etc`, which are normalized to `/private` before checking.
 - Non-local/cloud file systems can have unusual rename behavior.
 - With -N, the integrity checks are explicitly disabled.
 - Temporary files may remain if the process is killed or power fails.
