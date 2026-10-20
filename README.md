@@ -112,7 +112,7 @@ cargo build --release --locked
 
 The GitHub Actions CI checks builds and tests on Linux, macOS, and Windows.
 
-See [Specification](docs/SPECIFICATION.md), [Roadmap](docs/ROADMAP.md) and [Changelog](CHANGELOG.md).
+See [Specification](docs/SPECIFICATION.md) and [Changelog](CHANGELOG.md).
 
 ## License
 

@@ -1,6 +1,6 @@
 # Technical specification — MCH 0.1.0
 
-Status: implementation contract, not a formal safety proof. The original January 2026 plan could not be completely recovered, so undocumented future features are not presented as original requirements.
+Status: implementation contract, not a formal safety proof.
 
 ## Goal and interface
 
