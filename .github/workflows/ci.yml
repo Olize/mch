@@ -1,8 +1,7 @@
 name: CI
 
 on:
-  # Push checks on private main are used by the release gate.
-  # Feature branches are checked by pull_request to avoid duplicate runs.
+  # Run on protected public main and on pull requests.
   push:
     branches: [main]
   pull_request:
