@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 — 2026-10-21
+
+- Enforce no-overwrite at commit time on Linux/Android with RENAME_NOREPLACE, and otherwise safe no-replace hard-link publication.
+- Use the original private staging file handle for all copy modes; change file permissions only after publication.
+- Sync data before overwriting, published metadata for overwrites/moves and destination directories on Unix overwrites.
+- Retry interrupted reads and allocate large progress buffers on the heap.
+- Regression tests: late destinations, dangling symlinks, eight simultaneous publishers.
+- Sync the published directory after resumed overwrites even without move; regression test checks intact source and matching destination.
+- Tests on Termux and Fedora vm01 include forced interruption and verified restart; GitHub CI covers Linux, macOS and Windows.
+
 ## 0.2.0 — 2026-10-21
 
 - Resume staging remains owner-private (0600) until the rename publishes it; final permissions are set on the published inode to keep interruptions resumable.

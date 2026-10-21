@@ -1,4 +1,4 @@
-# Technical specification — MCH 0.2.0
+# Technical specification — MCH 0.2.1
 
 Status: implementation contract, not a formal safety proof.
 
@@ -45,6 +45,14 @@ Preflight errors must leave originals untouched. Failures in the copy phase reta
 - After successful independent verification and metadata application, the stage is renamed to its destination. The source is removed only after success when --move is selected.
 - A kill/power interruption can leave incomplete staging and metadata. A mismatched or missing metadata pair is a deliberate hard error, not silently reset. The source/destination filesystem must provide safe regular-file and rename semantics.
 - This does **not** defend against hostile races or a same-inode/same-size/same-mtime content mutation, cannot guarantee directory durability on power loss, and does not resume directory trees, multiple files or Windows copies.
+
+## v0.2.1 security patch
+
+- The preflight destination check is not the final publication decision. When overwriting is disabled, publication must be atomic no-replace: Linux/Android use renameat2(RENAME_NOREPLACE) and a fail-closed hard-link fallback where supported; other platforms use a no-replace hard link or safely refuse publication.
+- Normal regular-file copying retains an open private staging file handle instead of reopening the path with fs::copy. Unix staging stays private (0600) until publication; source permissions are then applied via the open handle.
+- With explicit overwrite or move, staged bytes and published metadata are synchronized. On Unix, explicit overwrites synchronize destination directories, including resume overwrite without move.
+- Hash and progress reads retry Interrupted; the 1 MiB progress buffer resides on the heap.
+- These changes do not defend against all hostile parent-directory races or guarantee power-loss durability on all filesystems.
 
 ## Limitations and security boundaries
 

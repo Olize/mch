@@ -2,7 +2,7 @@
 
 **MCH** is a Rust command-line tool for copying or moving local files and directory trees with optional post-copy integrity verification. Its default hash is **BLAKE3**.
 
-Current version: **0.2.0**. Licensed under **GNU AGPL-3.0-or-later**.
+Current version: **0.2.1**. Licensed under **GNU AGPL-3.0-or-later**.
 
 ## Features
 
@@ -14,7 +14,8 @@ Current version: **0.2.0**. Licensed under **GNU AGPL-3.0-or-later**.
 - Preserve Unix symbolic links as links, including dangling links; links are **not followed** when traversing a directory.
 - Preview all changes with `--dry-run`.
 - Refuse to overwrite existing files by default; use `--overwrite` explicitly.
-- Stage regular files in the destination directory and rename them into place only after successful verification.
+- Enforce a safe, atomic no-replace publication when overwrite is disabled; concurrent writers cannot silently replace a late destination.
+- Stage regular files privately in the destination directory and publish only after successful verification, keeping the staging file handle open throughout copying.
 - With `--move`, remove only **planned source files and subsequently empty planned directories** after successful copy/verification and destination synchronization. A new file in the source tree causes a refusal rather than recursive deletion.
 - Reject copying a directory into itself, duplicate destination names, destination parent symlinks, and special files (e.g. FIFOs).
 
@@ -104,7 +105,7 @@ mch --resume --progress always large.iso /backup/large.iso
 **Important: MCH is not a transactional backup system.**
 
 - Verification normally reads the operating-system **page cache** after writing; equal hashes do not prove that media/controller data has been durably written or will survive a power loss.
-- During `--move` MCH synchronizes staged regular files before publishing and, **on Unix**, synchronizes affected destination directory entries before removing planned source files. Filesystems, controllers and power failures may still behave differently, and MCH is not a transactional backup. On Windows, destination directory persistence is not guaranteed.
+- During explicit overwrites and moves, MCH synchronizes staged regular file contents and on Unix also synchronizes affected destination directory entries. Actual power-loss durability still depends on the filesystem and hardware.
 - MCH checks the planned paths before copying and performs verification before committing each file. It does not take a filesystem snapshot. If sources change during copying, verification may fail; sources must be kept stable for reliable results.
 - An error partway through an operation may leave some **completed** destination files or newly created directories behind. New directories can temporarily retain default permissions/timestamps until finalization succeeds. Sources are retained if copying or verification fails. It is safe to inspect the destination and retry, using `--overwrite` if appropriate.
 - For a successful `--move`, original sources are deleted after verification. Deleting originals can itself fail, in which case both copies may remain. Do not assume an all-or-nothing transaction across sources.

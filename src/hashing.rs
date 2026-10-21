@@ -7,6 +7,16 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+// An interrupted read is not EOF or corrupted data; try the same read again.
+fn read_retry(file: &mut File, buffer: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match file.read(buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
 pub(crate) fn hash_file(path: &Path, algorithm: HashAlg) -> Result<String> {
     let mut file =
         File::open(path).with_context(|| format!("open for hashing: {}", path.display()))?;
@@ -16,7 +26,7 @@ pub(crate) fn hash_file(path: &Path, algorithm: HashAlg) -> Result<String> {
         ($type:ty) => {{
             let mut hasher = <$type>::new();
             loop {
-                let n = file.read(&mut buffer)?;
+                let n = read_retry(&mut file, &mut buffer)?;
                 if n == 0 {
                     break;
                 }
@@ -30,7 +40,7 @@ pub(crate) fn hash_file(path: &Path, algorithm: HashAlg) -> Result<String> {
         HashAlg::Blake3 => {
             let mut hasher = blake3::Hasher::new();
             loop {
-                let n = file.read(&mut buffer)?;
+                let n = read_retry(&mut file, &mut buffer)?;
                 if n == 0 {
                     break;
                 }
@@ -47,7 +57,7 @@ pub(crate) fn hash_file(path: &Path, algorithm: HashAlg) -> Result<String> {
         HashAlg::Xxh3 => {
             let mut hasher = xxhash_rust::xxh3::Xxh3::new();
             loop {
-                let n = file.read(&mut buffer)?;
+                let n = read_retry(&mut file, &mut buffer)?;
                 if n == 0 {
                     break;
                 }

@@ -471,6 +471,60 @@ fn new_temp_path(destination: &Path) -> Result<TempPath> {
     ))
 }
 
+// Enforce no-overwrite *at publication*, not only with a preflight check.
+// Creating the final hard link is atomic and fails if any inode (including a
+// dangling symlink) appeared at the destination. Both names share one inode
+// briefly, then the temporary name is removed. Never fall back to rename:
+// rename would silently replace a concurrently created destination.
+pub(crate) fn publish_stage(stage: &Path, destination: &Path, overwrite: bool) -> Result<()> {
+    if !overwrite {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let src = CString::new(stage.as_os_str().as_bytes())
+                .context("temporary path contains a NUL")?;
+            let dst = CString::new(destination.as_os_str().as_bytes())
+                .context("destination path contains a NUL")?;
+            // Native atomic move with RENAME_NOREPLACE. This also handles
+            // Android environments that prohibit owner-created hard links.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    libc::AT_FDCWD,
+                    src.as_ptr(),
+                    libc::AT_FDCWD,
+                    dst.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            // On older kernels or unsupported filesystems, try an equally
+            // no-replace link operation. Never fall back to fs::rename.
+            if !matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+            ) {
+                return Err(error)
+                    .with_context(|| format!("no-replace publish {}", destination.display()));
+            }
+        }
+        fs::hard_link(stage, destination).with_context(|| {
+            format!(
+                "destination appeared or filesystem does not support safe no-replace publish: {}",
+                destination.display()
+            )
+        })?;
+        fs::remove_file(stage)
+            .with_context(|| format!("remove published temporary name {}", stage.display()))?;
+        return Ok(());
+    }
+    atomic_replace(stage, destination)
+}
+
 pub(crate) fn atomic_replace(stage: &Path, destination: &Path) -> Result<()> {
     #[cfg(windows)]
     {
@@ -509,21 +563,24 @@ fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Resu
     check_destination_file(&task.source, &task.destination, cli.overwrite)?;
 
     let temporary = new_temp_path(&task.destination)?;
-    match task.kind {
+    let (staged_handle, original_permissions) = match task.kind {
         Kind::Regular => {
-            // Reserving exclusively makes stale temporary files non-destructive.
+            // Exclusive creation keeps stale names non-destructive; all writes
+            // use the same open file descriptor (never reopen by path).
             let mut staged = reserve_private_stage(&temporary.0)?;
+            let mut source = fs::File::open(&task.source)
+                .with_context(|| format!("open source {}", task.source.display()))?;
+            let original_permissions = source.metadata()?.permissions();
             if let Some(progress) = progress {
-                // Count bytes only when progress is visible. Streaming is needed
-                // so one large file can report progress before completion.
-                let mut source = fs::File::open(&task.source)
-                    .with_context(|| format!("open source {}", task.source.display()))?;
-                let source_permissions = source.metadata()?.permissions();
-                let mut buffer = [0_u8; 1024 * 1024];
+                let mut buffer = vec![0_u8; 1024 * 1024];
                 loop {
-                    let size = source
-                        .read(&mut buffer)
-                        .with_context(|| format!("read source {}", task.source.display()))?;
+                    let size = loop {
+                        match source.read(&mut buffer) {
+                            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                            result => break result,
+                        }
+                    }
+                    .with_context(|| format!("read source {}", task.source.display()))?;
                     if size == 0 {
                         break;
                     }
@@ -532,15 +589,10 @@ fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Resu
                         .with_context(|| format!("write staged file {}", temporary.0.display()))?;
                     progress.add_bytes(size as u64);
                 }
-                drop(staged);
-                drop(source);
-                fs::set_permissions(&temporary.0, source_permissions)
-                    .with_context(|| format!("copy file permissions {}", temporary.0.display()))?;
             } else {
-                // Keep platform-optimized filesystem copying (e.g. copy_file_range)
-                // when progress is off; do not incur a streaming performance cost.
-                drop(staged);
-                fs::copy(&task.source, &temporary.0).with_context(|| {
+                // std::io::copy specializes file-to-file transfers where the
+                // platform permits; crucially it uses our private open handle.
+                std::io::copy(&mut source, &mut staged).with_context(|| {
                     format!(
                         "copy {} -> {}",
                         task.source.display(),
@@ -548,6 +600,7 @@ fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Resu
                     )
                 })?;
             }
+            drop(source);
 
             if !cli.no_hash {
                 let original_hash = hash_file(&task.source, cli.hash)?;
@@ -561,6 +614,7 @@ fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Resu
                     );
                 }
             }
+            (Some(staged), Some(original_permissions))
         }
         Kind::Symlink => {
             #[cfg(unix)]
@@ -571,11 +625,12 @@ fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Resu
                 if !cli.no_hash && fs::read_link(&temporary.0)? != link {
                     bail!("symlink verification FAILED: {}", task.source.display());
                 }
+                (None, None)
             }
             #[cfg(not(unix))]
             bail!("symlink copies are unsupported on this platform");
         }
-    }
+    };
 
     // Apply times to the temporary object before publishing it atomically.
     // Symlink times must never be applied through the link to its target.
@@ -593,56 +648,48 @@ fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Resu
         }
     }
 
-    // For a move, flush the complete staged file AND its metadata before
-    // publishing. Hashing may have read cached data, not durable storage.
-    if cli.move_mode && matches!(task.kind, Kind::Regular) {
-        #[cfg(not(windows))]
-        fs::File::open(&temporary.0)
-            .with_context(|| format!("open staged data for sync {}", temporary.0.display()))?
+    // Keep the original private staging handle until after publication.
+    // Flush verified bytes before any destructive replacement or move,
+    // including on Windows. Ordinary copies retain the faster default.
+    if (cli.move_mode || cli.overwrite)
+        && let Some(staged) = &staged_handle
+    {
+        staged
             .sync_all()
             .with_context(|| format!("sync staged data {}", temporary.0.display()))?;
-        #[cfg(windows)]
-        {
-            // Windows FlushFileBuffers requires a GENERIC_WRITE file handle;
-            // sync_all on File::open (read-only) returns AccessDenied.
-            // fs::copy may also have marked the staged file read-only.
-            let permissions = fs::metadata(&temporary.0)?.permissions();
-            if permissions.readonly() {
-                let mut writable = permissions.clone();
-                // On Windows this toggles FILE_ATTRIBUTE_READONLY only;
-                // Unix executable-bit concerns from this Clippy lint do not apply.
-                #[allow(clippy::permissions_set_readonly_false)]
-                writable.set_readonly(false);
-                fs::set_permissions(&temporary.0, writable)?;
-            }
-            let sync_result = (|| -> Result<()> {
-                let staged = fs::OpenOptions::new()
-                    .write(true)
-                    .open(&temporary.0)
-                    .with_context(|| {
-                        format!(
-                            "open writable staged data for sync {}",
-                            temporary.0.display()
-                        )
-                    })?;
-                if permissions.readonly() {
-                    // Restore the original source's readonly flag before sync.
-                    fs::set_permissions(&temporary.0, permissions.clone())?;
-                }
-                staged
-                    .sync_all()
-                    .with_context(|| format!("sync staged data {}", temporary.0.display()))
-            })();
-            if sync_result.is_err() && permissions.readonly() {
-                let _ = fs::set_permissions(&temporary.0, permissions);
-            }
-            sync_result?;
-        }
     }
 
     // Recheck before committing: the target might have changed during a long copy.
     check_destination_file(&task.source, &task.destination, cli.overwrite)?;
-    atomic_replace(&temporary.0, &task.destination)?;
+    publish_stage(&temporary.0, &task.destination, cli.overwrite)?;
+    // Do not relax 0600 while staging. Apply original permissions through
+    // the still-open inode only after it has been safely published.
+    if let (Some(staged), Some(permissions)) = (&staged_handle, original_permissions) {
+        staged.set_permissions(permissions).with_context(|| {
+            format!(
+                "apply published file permissions {}",
+                task.destination.display()
+            )
+        })?;
+        if cli.move_mode || cli.overwrite {
+            staged.sync_all().with_context(|| {
+                format!(
+                    "sync published file metadata {}",
+                    task.destination.display()
+                )
+            })?;
+        }
+    }
+
+    // For a destructive overwrite the rename itself must be synchronized on
+    // Unix after data and metadata; otherwise power loss can undo the rename.
+    #[cfg(unix)]
+    if cli.overwrite {
+        fs::File::open(parent)
+            .with_context(|| format!("open published directory {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("sync published directory {}", parent.display()))?;
+    }
 
     let label = if matches!(task.kind, Kind::Symlink) {
         "SYMLINK"
@@ -983,6 +1030,72 @@ pub(crate) fn execute(cli: &Cli, plan: &Plan) -> Result<()> {
 mod move_safety_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn publication_without_overwrite_refuses_a_new_target() {
+        let t = tempfile::tempdir().unwrap();
+        let stage = t.path().join("staged");
+        let destination = t.path().join("new-target");
+        fs::write(&stage, b"new copy").unwrap();
+        fs::write(&destination, b"precious other data").unwrap();
+        assert!(publish_stage(&stage, &destination, false).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"precious other data");
+        assert_eq!(fs::read(&stage).unwrap(), b"new copy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_without_overwrite_refuses_dangling_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let stage = t.path().join("staged");
+        let destination = t.path().join("new-target");
+        fs::write(&stage, b"new copy").unwrap();
+        symlink(t.path().join("missing"), &destination).unwrap();
+        assert!(publish_stage(&stage, &destination, false).is_err());
+        assert!(
+            fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&stage).unwrap(), b"new copy");
+    }
+
+    #[test]
+    fn concurrent_no_overwrite_publications_have_one_winner() {
+        use std::sync::{Arc, Barrier};
+        let t = tempfile::tempdir().unwrap();
+        let target = t.path().join("shared-destination");
+        let num = 8;
+        let barrier = Arc::new(Barrier::new(num));
+        let mut workers = Vec::new();
+        for id in 0..num {
+            let path = t.path().join(format!("stage-{id}"));
+            fs::write(&path, format!("payload-{id}")).unwrap();
+            let target = target.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let result = publish_stage(&path, &target, false);
+                (id, result.is_ok())
+            }));
+        }
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let winners: Vec<_> = results.iter().filter(|(_, ok)| *ok).collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one simultaneous publisher must win"
+        );
+        assert_eq!(
+            fs::read_to_string(target).unwrap(),
+            format!("payload-{}", winners[0].0)
+        );
+    }
 
     #[cfg(unix)]
     #[test]

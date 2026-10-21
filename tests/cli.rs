@@ -1065,6 +1065,26 @@ fn resume_existing_destination_needs_overwrite_and_move_removes_only_after_hash(
     assert_eq!(fs::read(&dst).unwrap(), b"verified copied content");
 }
 
+#[cfg(unix)]
+#[test]
+fn resume_overwrite_without_move_keeps_source_and_replaces_target() {
+    let t = TempDir::new().unwrap();
+    let src = t.path().join("source");
+    let dst = t.path().join("destination");
+    fs::write(&src, b"verified replacement for resume overwrite").unwrap();
+    fs::write(&dst, b"old target must be replaced").unwrap();
+    let part = seed_resume_partial(&src, &dst, 12);
+    assert_success(mch(&[
+        "--resume",
+        "--overwrite",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]));
+    assert!(!part.exists());
+    assert_eq!(fs::read(&src).unwrap(), fs::read(&dst).unwrap());
+    assert!(src.exists(), "non-move overwrite must never delete source");
+}
+
 #[test]
 fn resume_rejects_unsupported_flags_and_dry_run_does_not_write() {
     let t = TempDir::new().unwrap();

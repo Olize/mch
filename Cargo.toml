@@ -1,6 +1,6 @@
 [package]
 name = "mch"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Mighty Copy with Hash (mch) - copy/move with post-copy verification (default: BLAKE3)."
@@ -9,7 +9,7 @@ readme = "README.md"
 
 [package.metadata.mch-release]
 # Explicit review decision; automatic version bump alone must not publish resume.
-approved_unix_resume = "v1-single-regular-file"
+approved_unix_resume = "v1-single-regular-file-reviewed-0.2.1-hardening"
 
 [dependencies]
 anyhow = "1"
