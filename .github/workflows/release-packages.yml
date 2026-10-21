@@ -1,0 +1,215 @@
+name: Release packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing stable release tag, e.g. v0.2.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-packages-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Validate published tag
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.guard.outputs.tag }}
+      sha: ${{ steps.guard.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: guard
+        name: Check tag, version, repository history and published release
+        shell: bash
+        env:
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid stable version tag"; exit 1; }
+          git show-ref --verify "refs/tags/$TAG" >/dev/null
+          sha="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          git merge-base --is-ancestor "$sha" origin/main || { echo "Tag is not on public main"; exit 1; }
+          version="$(git show "$sha:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -n1)"
+          [[ "$TAG" == "v$version" ]] || { echo "Tag and Cargo version mismatch"; exit 1; }
+          [[ "$(gh release view "$TAG" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease')" == false ]] || { echo "Release must be published and stable"; exit 1; }
+          [[ "$(gh release view "$TAG" --json targetCommitish --jq .targetCommitish)" == "$sha" ]] || { echo "Release points to wrong commit"; exit 1; }
+          printf 'tag=%s\nsha=%s\n' "$TAG" "$sha" >> "$GITHUB_OUTPUT"
+
+  binary:
+    name: Binary ${{ matrix.platform }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            platform: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            binary: mch.exe
+          - runner: macos-15
+            platform: macos-aarch64
+            target: aarch64-apple-darwin
+            binary: mch
+          - runner: ubuntu-22.04
+            platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            binary: mch
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ needs.verify.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
+      BINARY: ${{ matrix.binary }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - name: Assert native architecture, test and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          [[ "$host" == "$TARGET" ]] || { echo "Wrong native architecture: $host"; exit 1; }
+          if [[ "$PLATFORM" == macos-aarch64 ]]; then
+            [[ "$(uname -m)" == arm64 ]] || { echo "Not an Apple Silicon machine"; exit 1; }
+          fi
+          rustup target add "$TARGET"
+          cargo test --locked
+          cargo build --release --locked --target "$TARGET"
+          test -s "target/$TARGET/release/$BINARY"
+          version="$(printf '%s' "$TAG" | cut -c2-)"
+          actual="$( "target/$TARGET/release/$BINARY" -v | tail -n1 | tr -d '\r' )"
+          [[ "$actual" == "$version" ]] || { echo "Wrong executable version: $actual"; exit 1; }
+      - name: Package executable with license and README
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="mch-$TAG-$PLATFORM"
+          mkdir -p "bundle/$archive" dist
+          cp "target/$TARGET/release/$BINARY" "bundle/$archive/$BINARY"
+          cp README.md LICENSE "bundle/$archive/"
+          printf 'Version: %s\nTarget: %s\nSource commit: %s\n' "$TAG" "$TARGET" "${{ needs.verify.outputs.sha }}" > "bundle/$archive/BUILD-INFO.txt"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            pwsh -NoProfile -Command "Compress-Archive -LiteralPath 'bundle/$archive' -DestinationPath 'dist/$archive.zip' -CompressionLevel Optimal -Force"
+          else
+            chmod 755 "bundle/$archive/$BINARY"
+            tar -czf "dist/$archive.tar.gz" -C bundle "$archive"
+          fi
+          test "$(find dist -type f | wc -l | tr -d ' ')" -eq 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  source:
+    name: Source ZIP and TAR.GZ
+    needs: verify
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.verify.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+      - name: Archive exactly the tagged public source
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="mch-$TAG-src"
+          mkdir -p dist
+          git archive --format=zip --prefix="$prefix/" HEAD > "dist/$prefix.zip"
+          git archive --format=tar --prefix="$prefix/" HEAD | gzip -n > "dist/$prefix.tar.gz"
+          unzip -Z1 "dist/$prefix.zip" | grep -Fx "$prefix/Cargo.toml"
+          tar -tzf "dist/$prefix.tar.gz" | grep -Fx "$prefix/Cargo.lock"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-sources
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish archives and SHA256 checksums
+    needs: [verify, binary, source]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.verify.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify all archives and generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          tag = os.environ["TAG"]
+          folder = Path("dist")
+          expected = {
+              f"mch-{tag}-src.zip",
+              f"mch-{tag}-src.tar.gz",
+              f"mch-{tag}-windows-x86_64.zip",
+              f"mch-{tag}-macos-aarch64.tar.gz",
+              f"mch-{tag}-linux-x86_64.tar.gz",
+          }
+          found = {p.name for p in folder.iterdir() if p.is_file()}
+          assert found == expected, f"Expected five archives, got: {found}"
+          for filename in sorted(expected):
+              file = folder / filename
+              assert file.stat().st_size > 1000, f"Archive is empty: {filename}"
+              root = filename.removesuffix(".tar.gz").removesuffix(".zip")
+              if filename.endswith(".zip"):
+                  with zipfile.ZipFile(file) as z:
+                      assert z.testzip() is None
+                      members = set(z.namelist())
+              else:
+                  with tarfile.open(file, "r:gz") as t:
+                      members = {m.name for m in t.getmembers()}
+              name = "Cargo.toml" if "-src." in filename else ("mch.exe" if "windows" in filename else "mch")
+              assert f"{root}/{name}" in members, f"Missing {name} in {filename}"
+              if "-src." not in filename:
+                  assert f"{root}/README.md" in members
+                  assert f"{root}/LICENSE" in members
+          with (folder / "SHA256SUMS.txt").open("w", encoding="ascii") as out:
+              for filename in sorted(expected):
+                  with (folder / filename).open("rb") as src:
+                      digest = hashlib.file_digest(src, "sha256").hexdigest()
+                  out.write(f"{digest}  {filename}\n")
+          print((folder / "SHA256SUMS.txt").read_text())
+          PY
+      - name: Upload to the existing published GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/* --clobber
+          count="$(gh release view "$TAG" --json assets --jq '.assets | length')"
+          [[ "$count" -eq 6 ]] || { echo "Expected six release assets, found $count"; exit 1; }
+          gh release view "$TAG" --json assets --jq '[.assets[].name]'
