@@ -2,3 +2,7 @@
 /target
 /.idea
 *.log
+
+# Private release guard unit-test bytecode
+__pycache__/
+*.pyc
