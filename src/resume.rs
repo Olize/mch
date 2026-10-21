@@ -390,7 +390,7 @@ mod unix {
         stage.sync_all().context("sync private staged metadata")?;
         crate::engine::check_destination_file(source, destination, cli.overwrite)?;
         inode_unchanged(&stage, &partial_path)?;
-        crate::engine::atomic_replace(&partial_path, destination)
+        crate::engine::publish_stage(&partial_path, destination, cli.overwrite)
             .context("publish fully verified resumed copy")?;
         // The inode is now the FINAL destination, not a resumable .part.
         // Set permissions via the already-open handle, avoiding a pathname
@@ -402,21 +402,26 @@ mod unix {
             .sync_all()
             .context("sync final resumed file permissions")?;
         drop(stage);
-        if cli.move_mode {
-            // A synced *file* alone is not enough to durably record the rename.
-            // Never remove the only source until the destination directory's
-            // new entry is synced. This requires a filesystem that supports it.
+        // A synced file alone does not durably record a published directory
+        // entry. Sync the directory on every overwrite, even without --move.
+        // Moving also requires the sync before the source may be deleted.
+        if cli.move_mode || cli.overwrite {
             fs::File::open(parent)
                 .with_context(|| {
-                    format!("open destination directory for sync: {}", parent.display())
+                    format!(
+                        "open resumed destination directory for sync: {}",
+                        parent.display()
+                    )
                 })?
                 .sync_all()
                 .with_context(|| {
                     format!(
-                        "sync resumed destination directory before source deletion: {}",
+                        "sync published resumed destination directory: {}",
                         parent.display()
                     )
                 })?;
+        }
+        if cli.move_mode {
             require_original_source(source, &src, &initial_meta)
                 .context("source changed before resumed move cleanup")?;
         }
