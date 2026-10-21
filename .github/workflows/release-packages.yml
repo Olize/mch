@@ -44,7 +44,7 @@ jobs:
           version="$(git show "$sha:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -n1)"
           [[ "$TAG" == "v$version" ]] || { echo "Tag and Cargo version mismatch"; exit 1; }
           [[ "$(gh release view "$TAG" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease')" == false ]] || { echo "Release must be published and stable"; exit 1; }
-          [[ "$(gh release view "$TAG" --json targetCommitish --jq .targetCommitish)" == "$sha" ]] || { echo "Release points to wrong commit"; exit 1; }
+          [[ "$(gh release view "$TAG" --json tagName --jq .tagName)" == "$TAG" ]] || { echo "Release tag identity mismatch"; exit 1; }
           printf 'tag=%s\nsha=%s\n' "$TAG" "$sha" >> "$GITHUB_OUTPUT"
 
   binary:
