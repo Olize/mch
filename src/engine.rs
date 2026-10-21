@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use crate::{Cli, hashing::hash_file};
+use crate::{Cli, hashing::hash_file, progress::Progress};
 use anyhow::{Context, Result, anyhow, bail};
+use filetime::FileTime;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,18 +24,24 @@ struct FileTask {
     source: PathBuf,
     destination: PathBuf,
     kind: Kind,
+    source_times: Option<(FileTime, FileTime)>,
+    move_identity: Option<fs::Metadata>,
 }
 
 struct DirTask {
     source: PathBuf,
     destination: PathBuf,
     preexisting: bool,
+    source_atime: FileTime,
+    source_mtime: FileTime,
+    move_identity: Option<fs::Metadata>,
 }
 
 pub(crate) struct Plan {
     files: Vec<FileTask>,
     directories: Vec<DirTask>,
     sources: Vec<PathBuf>,
+    total_bytes: u64,
 }
 
 fn absolute(path: &Path) -> Result<PathBuf> {
@@ -128,7 +135,7 @@ fn no_symlink_parents(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_directory(path: &Path) -> Result<()> {
+pub(crate) fn ensure_directory(path: &Path) -> Result<()> {
     // Do not follow destination symlinks, including those inserted after preflight.
     let mut missing = Vec::new();
     let mut cursor = path;
@@ -166,7 +173,11 @@ fn ensure_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn check_destination_file(source: &Path, destination: &Path, overwrite: bool) -> Result<()> {
+pub(crate) fn check_destination_file(
+    source: &Path,
+    destination: &Path,
+    overwrite: bool,
+) -> Result<()> {
     no_symlink_parents(destination)?;
     match existing_metadata(destination)? {
         Some(meta) if meta.is_dir() => {
@@ -210,6 +221,8 @@ fn register_file(plan: &mut Plan, source: &Path, target: &Path, kind: Kind) {
         source: source.to_path_buf(),
         destination: target.to_path_buf(),
         kind,
+        source_times: None,
+        move_identity: None,
     });
 }
 
@@ -220,10 +233,16 @@ fn collect_directory(plan: &mut Plan, source: &Path, destination: &Path) -> Resu
         Some(_) => bail!("destination is not a directory: {}", destination.display()),
         None => false,
     };
+    // Snapshot directory times BEFORE read_dir mutates its access time.
+    let source_meta = fs::metadata(source)
+        .with_context(|| format!("stat source directory {}", source.display()))?;
     plan.directories.push(DirTask {
         source: source.to_path_buf(),
         destination: destination.to_path_buf(),
         preexisting,
+        source_atime: FileTime::from_last_access_time(&source_meta),
+        source_mtime: FileTime::from_last_modification_time(&source_meta),
+        move_identity: None,
     });
 
     let mut entries = fs::read_dir(source)
@@ -294,6 +313,7 @@ pub(crate) fn build_plan(cli: &Cli, destination: &Path) -> Result<Plan> {
         files: Vec::new(),
         directories: Vec::new(),
         sources,
+        total_bytes: 0,
     };
     for source in plan.sources.clone() {
         let kind = fs::symlink_metadata(&source)
@@ -374,11 +394,49 @@ pub(crate) fn build_plan(cli: &Cli, destination: &Path) -> Result<Plan> {
             );
         }
         check_destination_file(&task.source, &task.destination, cli.overwrite)?;
+        if matches!(task.kind, Kind::Regular) {
+            let size = fs::metadata(&task.source)
+                .with_context(|| format!("read file size: {}", task.source.display()))?
+                .len();
+            plan.total_bytes = plan
+                .total_bytes
+                .checked_add(size)
+                .context("total source size exceeds u64 range")?;
+        }
     }
     // Detect file paths that would become parents of any planned target.
     for dir in &plan.directories {
         if targets.contains(&dir.destination) {
             bail!("directory/file conflict: {}", dir.destination.display());
+        }
+    }
+    if cli.move_mode {
+        // Save source identities before any copying. Files are never deleted
+        // merely because the same name happens to exist later.
+        for task in &mut plan.files {
+            task.move_identity = Some(
+                fs::symlink_metadata(&task.source)
+                    .with_context(|| format!("snapshot move source {}", task.source.display()))?,
+            );
+        }
+        for directory in &mut plan.directories {
+            directory.move_identity =
+                Some(fs::symlink_metadata(&directory.source).with_context(|| {
+                    format!("snapshot move directory {}", directory.source.display())
+                })?);
+        }
+    }
+    if cli.preserve_times {
+        // Snapshot EVERY source inode before the first copy/verification read.
+        // Hard-linked source names share an atime; a per-worker snapshot would
+        // give later workers a newer value after the first source was read.
+        for task in &mut plan.files {
+            let meta = fs::symlink_metadata(&task.source)
+                .with_context(|| format!("snapshot source times {}", task.source.display()))?;
+            task.source_times = Some((
+                FileTime::from_last_access_time(&meta),
+                FileTime::from_last_modification_time(&meta),
+            ));
         }
     }
     Ok(plan)
@@ -391,6 +449,20 @@ impl Drop for TempPath {
     }
 }
 
+fn reserve_private_stage(path: &Path) -> Result<fs::File> {
+    // The temporary inode starts as 0600 even when the user's umask is 022.
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("reserve temporary file {}", path.display()))
+}
+
 fn new_temp_path(destination: &Path) -> Result<TempPath> {
     let parent = destination.parent().context("destination has no parent")?;
     let index = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -399,7 +471,7 @@ fn new_temp_path(destination: &Path) -> Result<TempPath> {
     ))
 }
 
-fn atomic_replace(stage: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn atomic_replace(stage: &Path, destination: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         if fs::symlink_metadata(destination).is_ok() {
@@ -428,7 +500,7 @@ fn atomic_replace(stage: &Path, destination: &Path) -> Result<()> {
         .with_context(|| format!("publish {} -> {}", stage.display(), destination.display()))
 }
 
-fn process_file(cli: &Cli, task: &FileTask) -> Result<()> {
+fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Result<()> {
     let parent = task
         .destination
         .parent()
@@ -440,19 +512,42 @@ fn process_file(cli: &Cli, task: &FileTask) -> Result<()> {
     match task.kind {
         Kind::Regular => {
             // Reserving exclusively makes stale temporary files non-destructive.
-            let reserved = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary.0)
-                .with_context(|| format!("reserve temporary file {}", temporary.0.display()))?;
-            drop(reserved); // Release the handle before copying/renaming, especially on Windows.
-            fs::copy(&task.source, &temporary.0).with_context(|| {
-                format!(
-                    "copy {} -> {}",
-                    task.source.display(),
-                    temporary.0.display()
-                )
-            })?;
+            let mut staged = reserve_private_stage(&temporary.0)?;
+            if let Some(progress) = progress {
+                // Count bytes only when progress is visible. Streaming is needed
+                // so one large file can report progress before completion.
+                let mut source = fs::File::open(&task.source)
+                    .with_context(|| format!("open source {}", task.source.display()))?;
+                let source_permissions = source.metadata()?.permissions();
+                let mut buffer = [0_u8; 1024 * 1024];
+                loop {
+                    let size = source
+                        .read(&mut buffer)
+                        .with_context(|| format!("read source {}", task.source.display()))?;
+                    if size == 0 {
+                        break;
+                    }
+                    staged
+                        .write_all(&buffer[..size])
+                        .with_context(|| format!("write staged file {}", temporary.0.display()))?;
+                    progress.add_bytes(size as u64);
+                }
+                drop(staged);
+                drop(source);
+                fs::set_permissions(&temporary.0, source_permissions)
+                    .with_context(|| format!("copy file permissions {}", temporary.0.display()))?;
+            } else {
+                // Keep platform-optimized filesystem copying (e.g. copy_file_range)
+                // when progress is off; do not incur a streaming performance cost.
+                drop(staged);
+                fs::copy(&task.source, &temporary.0).with_context(|| {
+                    format!(
+                        "copy {} -> {}",
+                        task.source.display(),
+                        temporary.0.display()
+                    )
+                })?;
+            }
 
             if !cli.no_hash {
                 let original_hash = hash_file(&task.source, cli.hash)?;
@@ -482,6 +577,69 @@ fn process_file(cli: &Cli, task: &FileTask) -> Result<()> {
         }
     }
 
+    // Apply times to the temporary object before publishing it atomically.
+    // Symlink times must never be applied through the link to its target.
+    if let Some((atime, mtime)) = task.source_times {
+        match task.kind {
+            Kind::Regular => filetime::set_file_times(&temporary.0, atime, mtime)
+                .with_context(|| format!("preserve file times {}", temporary.0.display()))?,
+            Kind::Symlink => {
+                #[cfg(unix)]
+                filetime::set_symlink_file_times(&temporary.0, atime, mtime)
+                    .with_context(|| format!("preserve symlink times {}", temporary.0.display()))?;
+                #[cfg(not(unix))]
+                bail!("symlink timestamps unsupported on this platform");
+            }
+        }
+    }
+
+    // For a move, flush the complete staged file AND its metadata before
+    // publishing. Hashing may have read cached data, not durable storage.
+    if cli.move_mode && matches!(task.kind, Kind::Regular) {
+        #[cfg(not(windows))]
+        fs::File::open(&temporary.0)
+            .with_context(|| format!("open staged data for sync {}", temporary.0.display()))?
+            .sync_all()
+            .with_context(|| format!("sync staged data {}", temporary.0.display()))?;
+        #[cfg(windows)]
+        {
+            // Windows FlushFileBuffers requires a GENERIC_WRITE file handle;
+            // sync_all on File::open (read-only) returns AccessDenied.
+            // fs::copy may also have marked the staged file read-only.
+            let permissions = fs::metadata(&temporary.0)?.permissions();
+            if permissions.readonly() {
+                let mut writable = permissions.clone();
+                // On Windows this toggles FILE_ATTRIBUTE_READONLY only;
+                // Unix executable-bit concerns from this Clippy lint do not apply.
+                #[allow(clippy::permissions_set_readonly_false)]
+                writable.set_readonly(false);
+                fs::set_permissions(&temporary.0, writable)?;
+            }
+            let sync_result = (|| -> Result<()> {
+                let staged = fs::OpenOptions::new()
+                    .write(true)
+                    .open(&temporary.0)
+                    .with_context(|| {
+                        format!(
+                            "open writable staged data for sync {}",
+                            temporary.0.display()
+                        )
+                    })?;
+                if permissions.readonly() {
+                    // Restore the original source's readonly flag before sync.
+                    fs::set_permissions(&temporary.0, permissions.clone())?;
+                }
+                staged
+                    .sync_all()
+                    .with_context(|| format!("sync staged data {}", temporary.0.display()))
+            })();
+            if sync_result.is_err() && permissions.readonly() {
+                let _ = fs::set_permissions(&temporary.0, permissions);
+            }
+            sync_result?;
+        }
+    }
+
     // Recheck before committing: the target might have changed during a long copy.
     check_destination_file(&task.source, &task.destination, cli.overwrite)?;
     atomic_replace(&temporary.0, &task.destination)?;
@@ -501,10 +659,187 @@ fn process_file(cli: &Cli, task: &FileTask) -> Result<()> {
         ),
         true,
     );
+    if let Some(progress) = progress {
+        progress.file_finished();
+    }
+    Ok(())
+}
+
+// A move is a two-phase operation: publish verified files, then remove ONLY
+// the sources that were explicitly recorded in the plan. Never recursively
+// delete the source tree: another application may have written new content.
+fn check_move_source_snapshot(plan: &Plan) -> Result<()> {
+    let mut planned = HashSet::new();
+    for file in &plan.files {
+        planned.insert(file.source.clone());
+        let original = file
+            .move_identity
+            .as_ref()
+            .context("missing pre-copy move source identity")?;
+        let now = fs::symlink_metadata(&file.source)
+            .with_context(|| format!("move source disappeared: {}", file.source.display()))?;
+        if now.file_type() != original.file_type()
+            || now.len() != original.len()
+            || now.modified()? != original.modified()?
+        {
+            bail!(
+                "move source was changed or replaced; refusing deletion: {}",
+                file.source.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if now.dev() != original.dev() || now.ino() != original.ino() {
+                bail!(
+                    "move source inode changed; refusing deletion: {}",
+                    file.source.display()
+                );
+            }
+        }
+    }
+    for dir in &plan.directories {
+        planned.insert(dir.source.clone());
+    }
+    for dir in &plan.directories {
+        let original = dir
+            .move_identity
+            .as_ref()
+            .context("missing pre-copy move directory identity")?;
+        let current = fs::symlink_metadata(&dir.source)?;
+        if !current.is_dir() || current.modified()? != original.modified()? {
+            bail!("move source directory changed: {}", dir.source.display());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if current.dev() != original.dev() || current.ino() != original.ino() {
+                bail!(
+                    "move source directory inode changed: {}",
+                    dir.source.display()
+                );
+            }
+        }
+        #[cfg(windows)]
+        {
+            // File-index / volume ID from std::MetadataExt are unstable on
+            // stable Rust. Creation-time + modification-time are the strongest
+            // portable standard-library check we can apply on Windows here.
+            use std::os::windows::fs::MetadataExt;
+            if current.creation_time() != original.creation_time() {
+                bail!(
+                    "move source directory was replaced: {}",
+                    dir.source.display()
+                );
+            }
+        }
+        for entry in fs::read_dir(&dir.source)
+            .with_context(|| format!("inspect move source {}", dir.source.display()))?
+        {
+            let path = entry?.path();
+            if !planned.contains(&path) {
+                bail!(
+                    "move source contains a new/unplanned entry; nothing deleted: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn move_directories_to_sync(plan: &Plan) -> Result<Vec<PathBuf>> {
+    use std::collections::BTreeSet;
+    // Snapshot which destination ancestors are MISSING *before* creating any.
+    // fsync only affected directories and the parent of the highest new
+    // directory. Unrelated ancestors (including / on Android) are not ours.
+    let mut affected = BTreeSet::new();
+    for file in &plan.files {
+        let parent = file
+            .destination
+            .parent()
+            .context("destination without parent")?;
+        affected.insert(parent.to_path_buf());
+        let mut current = parent;
+        loop {
+            if existing_metadata(current)?.is_some() {
+                break;
+            }
+            let outer = current.parent().context("no existing directory ancestor")?;
+            affected.insert(outer.to_path_buf());
+            current = outer;
+        }
+    }
+    for dir in &plan.directories {
+        affected.insert(dir.destination.clone()); // empty or modified directory
+        if !dir.preexisting {
+            // An empty tree may contain no FileTask at all: ensure every
+            // newly created ancestor and its first existing parent are synced.
+            let mut current = dir.destination.as_path();
+            loop {
+                if existing_metadata(current)?.is_some() {
+                    break;
+                }
+                let parent = current.parent().context("directory without parent")?;
+                affected.insert(parent.to_path_buf());
+                current = parent;
+            }
+        }
+    }
+    // Data and directory entries are synced from deepest to shallowest.
+    let mut dirs: Vec<_> = affected.into_iter().collect();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    Ok(dirs)
+}
+
+#[cfg(unix)]
+fn sync_move_destinations(dirs: &[PathBuf]) -> Result<()> {
+    for directory in dirs {
+        fs::File::open(directory)
+            .with_context(|| {
+                format!(
+                    "open destination directory for sync {}",
+                    directory.display()
+                )
+            })?
+            .sync_all()
+            .with_context(|| {
+                format!(
+                    "sync destination directory before source removal {}",
+                    directory.display()
+                )
+            })?;
+    }
     Ok(())
 }
 
 pub(crate) fn execute(cli: &Cli, plan: &Plan) -> Result<()> {
+    if cli.resume {
+        if plan.files.len() != 1
+            || !plan.directories.is_empty()
+            || !matches!(plan.files[0].kind, Kind::Regular)
+        {
+            bail!("--resume only supports one regular file, not directories or symlinks");
+        }
+        if cli.dry_run {
+            cli.report(
+                &format!(
+                    "RESUME DRY RUN {} -> {}",
+                    plan.files[0].source.display(),
+                    plan.files[0].destination.display()
+                ),
+                true,
+            );
+            return Ok(());
+        }
+        return crate::resume::copy(
+            cli,
+            &plan.files[0].source,
+            &plan.files[0].destination,
+            plan.files[0].source_times,
+        );
+    }
     if cli.dry_run {
         for dir in &plan.directories {
             cli.report(&format!("MKDIR {}", dir.destination.display()), true);
@@ -534,6 +869,12 @@ pub(crate) fn execute(cli: &Cli, plan: &Plan) -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(unix)]
+    let move_sync_directories = if cli.move_mode {
+        move_directories_to_sync(plan)?
+    } else {
+        Vec::new()
+    };
     for dir in &plan.directories {
         ensure_directory(&dir.destination)?;
     }
@@ -541,10 +882,29 @@ pub(crate) fn execute(cli: &Cli, plan: &Plan) -> Result<()> {
         .num_threads(cli.count)
         .build()
         .context("create worker pool")?;
-    pool.install(|| {
-        plan.files
-            .par_iter()
-            .try_for_each(|task| process_file(cli, task))
+    let tracker = Progress::new(plan.total_bytes, plan.files.len() as u64, !cli.no_hash);
+    let show_progress = cli.show_progress();
+    std::thread::scope(|scope| -> Result<()> {
+        let (sender, receiver) = std::sync::mpsc::channel::<bool>();
+        let reporter = if show_progress {
+            let tracker_ref = &tracker;
+            Some(scope.spawn(move || crate::progress::watch(tracker_ref, receiver)))
+        } else {
+            None
+        };
+        let progress = show_progress.then_some(&tracker);
+        let result = pool.install(|| {
+            plan.files
+                .par_iter()
+                .try_for_each(|task| process_file(cli, task, progress))
+        });
+        if let Some(reporter) = reporter {
+            let _ = sender.send(result.is_ok());
+            reporter
+                .join()
+                .map_err(|_| anyhow!("progress reporter thread panicked"))?;
+        }
+        result
     })?;
 
     // Preserve source directory permissions where we actually created a directory.
@@ -561,18 +921,46 @@ pub(crate) fn execute(cli: &Cli, plan: &Plan) -> Result<()> {
                     directory.destination.display()
                 )
             })?;
+            if cli.preserve_times {
+                // Restoring after writing descendants prevents child creation
+                // from invalidating the copied directory's modification time.
+                filetime::set_file_times(
+                    &directory.destination,
+                    directory.source_atime,
+                    directory.source_mtime,
+                )
+                .with_context(|| {
+                    format!(
+                        "preserve directory times {}",
+                        directory.destination.display()
+                    )
+                })?;
+            }
         }
     }
 
     if cli.move_mode {
-        // IMPORTANT: none of the originals are removed until every planned copy has verified.
+        // Fail closed if the input tree gained ANY unplanned entry after
+        // enumeration. Another process may be actively writing to it.
+        check_move_source_snapshot(plan)?;
+        #[cfg(unix)]
+        sync_move_destinations(&move_sync_directories)?;
+        // Remove only planned files and links. Never use remove_dir_all.
+        for file in &plan.files {
+            fs::remove_file(&file.source)
+                .with_context(|| format!("remove planned move source {}", file.source.display()))?;
+        }
+        // Remove only empty, planned directories, deepest first. If new
+        // entries appear during deletion, remove_dir fails and retains them.
+        for directory in plan.directories.iter().rev() {
+            fs::remove_dir(&directory.source).with_context(|| {
+                format!(
+                    "remove planned empty source directory {}",
+                    directory.source.display()
+                )
+            })?;
+        }
         for source in &plan.sources {
-            let ty = fs::symlink_metadata(source)?.file_type();
-            if ty.is_dir() {
-                fs::remove_dir_all(source)?;
-            } else {
-                fs::remove_file(source)?;
-            }
             cli.report(&format!("MOVED {}", source.display()), true);
         }
     }
@@ -589,4 +977,117 @@ pub(crate) fn execute(cli: &Cli, plan: &Plan) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod move_safety_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_regular_file_is_private_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let stage = t.path().join(".mch-tmp-test");
+        let file = reserve_private_stage(&stage).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn move_refuses_new_entries_after_planning_without_deleting_any_sources() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("ongoing-download");
+        let nested = src.join("nested");
+        let dest = t.path().join("backup");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("original.txt"), b"first copied").unwrap();
+        let cli = Cli::try_parse_from([
+            std::ffi::OsString::from("mch"),
+            std::ffi::OsString::from("--move"),
+            src.as_os_str().to_os_string(),
+            dest.as_os_str().to_os_string(),
+        ])
+        .unwrap();
+        let plan = build_plan(&cli, &dest).unwrap();
+        // A separate application adds a new file after the source scan.
+        fs::write(
+            nested.join("just-created.txt"),
+            b"never part of the copy plan",
+        )
+        .unwrap();
+        let error = execute(&cli, &plan).unwrap_err();
+        assert!(
+            error.to_string().contains("unplanned") || error.to_string().contains("changed"),
+            "incorrect failure: {error:#}"
+        );
+        assert_eq!(
+            fs::read(nested.join("original.txt")).unwrap(),
+            b"first copied"
+        );
+        assert_eq!(
+            fs::read(nested.join("just-created.txt")).unwrap(),
+            b"never part of the copy plan"
+        );
+        assert_eq!(
+            fs::read(dest.join("ongoing-download/nested/original.txt")).unwrap(),
+            b"first copied"
+        );
+        assert!(
+            !dest
+                .join("ongoing-download/nested/just-created.txt")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn move_refuses_replaced_empty_source_directory_after_planning() {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("original-dir");
+        let backup = t.path().join("saved-original");
+        let destination = t.path().join("target");
+        fs::create_dir(&source).unwrap();
+        let cli = Cli::try_parse_from([
+            std::ffi::OsString::from("mch"),
+            std::ffi::OsString::from("--move"),
+            source.as_os_str().to_os_string(),
+            destination.as_os_str().to_os_string(),
+        ])
+        .unwrap();
+        let plan = build_plan(&cli, &destination).unwrap();
+        // Another program replaced the empty directory with a different
+        // empty directory of the SAME name. Never remove this new inode.
+        fs::rename(&source, &backup).unwrap();
+        fs::create_dir(&source).unwrap();
+        // Make modification timestamps identical so the regression also
+        // exercises inode/creation-time identity checks rather than mtime.
+        let original_mtime = FileTime::from_last_modification_time(&fs::metadata(&backup).unwrap());
+        let replacement_atime = FileTime::from_last_access_time(&fs::metadata(&source).unwrap());
+        filetime::set_file_times(&source, replacement_atime, original_mtime).unwrap();
+        let result = execute(&cli, &plan);
+        assert!(result.is_err(), "must reject replaced source directory");
+        assert!(source.is_dir(), "new source directory was destroyed");
+        assert!(backup.is_dir(), "original directory was destroyed");
+    }
+
+    #[test]
+    fn move_refuses_replaced_source_after_planning() {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("source.bin");
+        let dest = t.path().join("destination.bin");
+        fs::write(&source, b"before").unwrap();
+        let cli = Cli::try_parse_from([
+            std::ffi::OsString::from("mch"),
+            std::ffi::OsString::from("--move"),
+            source.as_os_str().to_os_string(),
+            dest.as_os_str().to_os_string(),
+        ])
+        .unwrap();
+        let plan = build_plan(&cli, &dest).unwrap();
+        fs::remove_file(&source).unwrap();
+        fs::write(&source, b"replacement-longer").unwrap();
+        let err = execute(&cli, &plan).unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err:#}");
+        assert_eq!(fs::read(source).unwrap(), b"replacement-longer");
+    }
 }

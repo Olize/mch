@@ -2,7 +2,7 @@
 
 **MCH** is a Rust command-line tool for copying or moving local files and directory trees with optional post-copy integrity verification. Its default hash is **BLAKE3**.
 
-Current version: **0.1.0**. Licensed under **GNU AGPL-3.0-or-later**.
+Current version: **0.2.0**. Licensed under **GNU AGPL-3.0-or-later**.
 
 ## Features
 
@@ -15,7 +15,7 @@ Current version: **0.1.0**. Licensed under **GNU AGPL-3.0-or-later**.
 - Preview all changes with `--dry-run`.
 - Refuse to overwrite existing files by default; use `--overwrite` explicitly.
 - Stage regular files in the destination directory and rename them into place only after successful verification.
-- With `--move`, remove originals **only after all planned copies have completed successfully**.
+- With `--move`, remove only **planned source files and subsequently empty planned directories** after successful copy/verification and destination synchronization. A new file in the source tree causes a refusal rather than recursive deletion.
 - Reject copying a directory into itself, duplicate destination names, destination parent symlinks, and special files (e.g. FIFOs).
 
 ## Install
@@ -73,6 +73,9 @@ mch --help
 | `-N, --no-hash` | Disable content verification |
 | `--hash ALGORITHM` | Select hash algorithm; default BLAKE3 |
 | `--count N` | Number of parallel file workers; default 1, max 256 |
+| `--progress auto|always|never` | Screenreader-friendly transfer status; default auto (only when stderr is a terminal) |
+| `--preserve-times` | Preserve original access and modification times on files and newly created directories; also symlinks on Unix |
+| `--resume` | Opt-in, verified restart of a single regular file on Unix; rejects `-N`, directories, multiple files and Windows |
 | `-O, --only-src-content` | Copy only the contents of one directory |
 | `--overwrite` | Explicitly replace existing files or symlinks |
 | `--dry-run` | Check and show plan without modifying files |
@@ -83,19 +86,38 @@ mch --help
 
 When copying a directory **without** `-O`, the source directory name is always appended to the destination. When copying one regular file, an existing destination directory (or a path ending in the platform's separator) receives the source file under its original name. Without those conditions, the destination is treated as the file path.
 
+With `-N`, the final progress status explicitly says **COPY COMPLETE (NO HASH VERIFICATION)**; MCH must never report an unverified copy as verified.
+
+Progress messages appear on stderr as separate, readable lines (at most once per second plus a final copy summary). They report bytes transferred, copied-file count, approximate throughput and **copy ETA**, not a guaranteed end-to-end ETA; hash verification and source deletion take additional time. `--progress always` works with redirected logs. `--quiet` and `--dry-run` suppress progress. No animated progress bars or ANSI control sequences are used in progress output.
+
+### Verified resumable copies (Unix single-file mode)
+
+```bash
+mch --resume --progress always large.iso /backup/large.iso
+# If interrupted, repeat exactly the same command and paths.
+```
+
+`--resume` supports one regular file per invocation on Unix (tested under Linux, macOS and Android/Termux). It writes a hidden owner-private `.mch-resume-v1-*.part` file alongside the destination; `.meta` binds that staging data to the initial source inode, size and modification time. A persistent `.lock` file is intentional so simultaneous resumes cannot bypass the inode lock. All previously written bytes are checked byte-for-byte against the current source on each restart; final source and staged-file hashes must match before publishing. Changing the source, altering the stage or having a conflicting destination causes a refusal, not an automatic repair. For `--resume --move`, the destination parent must already exist and support directory synchronization before the source may be deleted. The user may need to remove abandoned staging/manifest files **manually** after reviewing them. Concurrent hostile filesystem modifications, power loss and incomplete metadata/directory durability are outside the guarantees of this release. Do **not** treat this as a transactional backup, a crash-proof data store, or a safe workflow on untested network/FUSE filesystems.
+
 ## Data safety and limitations
 
 **Important: MCH is not a transactional backup system.**
 
+- Verification normally reads the operating-system **page cache** after writing; equal hashes do not prove that media/controller data has been durably written or will survive a power loss.
+- During `--move` MCH synchronizes staged regular files before publishing and, **on Unix**, synchronizes affected destination directory entries before removing planned source files. Filesystems, controllers and power failures may still behave differently, and MCH is not a transactional backup. On Windows, destination directory persistence is not guaranteed.
 - MCH checks the planned paths before copying and performs verification before committing each file. It does not take a filesystem snapshot. If sources change during copying, verification may fail; sources must be kept stable for reliable results.
-- An error partway through an operation may leave some **completed** destination files or newly created directories behind. Sources are retained if copying or verification fails. It is safe to inspect the destination and retry, using `--overwrite` if appropriate.
+- An error partway through an operation may leave some **completed** destination files or newly created directories behind. New directories can temporarily retain default permissions/timestamps until finalization succeeds. Sources are retained if copying or verification fails. It is safe to inspect the destination and retry, using `--overwrite` if appropriate.
 - For a successful `--move`, original sources are deleted after verification. Deleting originals can itself fail, in which case both copies may remain. Do not assume an all-or-nothing transaction across sources.
 - `--overwrite` is atomic per regular file on Unix when source and destination are on the same mounted destination filesystem: the temporary file is created alongside its destination and renamed into place. On Windows, replacement may temporarily rename the old destination to a backup first; it is **not** an atomic replacement guarantee.
 - When `--overwrite` is not specified, existing regular files and links are never replaced. Existing destination directories may be merged; conflicting files are still rejected.
 - Symbolic links are preserved on Unix, but their *textual targets* are checked rather than hashing the objects they refer to. Windows symbolic-link copying is rejected.
-- Directory ownership, hard-link relationships, extended attributes, ACLs, creation times, and modification times are **not** preserved. Do not use MCH as a metadata-perfect backup.
+- `--preserve-times` optionally restores file access/modification times, newly created directory times, and Unix symlink times. Existing destination directories are never assigned source timestamps. Without this option, timestamps are not preserved intentionally. Timestamp operations can fail on unsupported filesystems and are not guarantees against external changes.
+- Directory ownership, hard-link relationships, extended attributes, ACLs, birth/creation times and sparse extents are **not** preserved. Do not use MCH as a metadata-perfect backup.
 - Special files (devices, sockets, FIFOs) are not copied.
 - Destination paths whose existing parent components are symbolic links are rejected deliberately to avoid writing through an unexpected alias. On macOS, the standard system-managed `/var`, `/tmp`, and `/etc` aliases into `/private` are normalized after verifying their expected targets; other symlink parents remain forbidden.
+- MCH reads both source and staged target for a hash comparison, usually **from the operating system's page cache**. This detects mismatches visible through filesystem reads but **does not establish physical-media durability or prove that the controller stored the data correctly**.
+- For `--move` on Unix, MCH syncs staged data and relevant destination directory entries before removing planned sources. Actual power-loss durability still depends on the operating system and filesystem; source-directory deletion is not itself transactionally committed. On Windows, no equivalent directory-fsync guarantee is claimed.
+- If copying fails after creating destination directories, partially created directories may retain default mode/timestamps until a later successful run. Inspect partial results before retrying, especially when copying restrictive directory permissions.
 - MCH does not protect against concurrent malicious filesystem mutation (TOCTOU), disk/controller faults below the filesystem, or corruption that occurs after verification.
 - Using `-N` disables post-copy integrity verification, including for moves.
 

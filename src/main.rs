@@ -2,6 +2,8 @@
 
 mod engine;
 mod hashing;
+mod progress;
+mod resume;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
@@ -33,6 +35,13 @@ impl HashAlg {
             Self::Xxh3 => "XXH3",
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq)]
+enum ProgressMode {
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Parser, Debug)]
@@ -84,6 +93,18 @@ struct Cli {
     #[arg(long = "no-color")]
     no_color: bool,
 
+    /// Line-based transfer progress: auto (TTY), always, or never
+    #[arg(long = "progress", value_enum, default_value_t = ProgressMode::Auto)]
+    progress: ProgressMode,
+
+    /// Preserve access and modification times on copied items (opt-in)
+    #[arg(long = "preserve-times")]
+    preserve_times: bool,
+
+    /// Restart a partially copied single regular file (Unix only; experimental)
+    #[arg(long = "resume")]
+    resume: bool,
+
     /// One or more source files/directories
     #[arg(required = true, num_args = 1..)]
     sources: Vec<PathBuf>,
@@ -96,6 +117,16 @@ struct Cli {
 impl Cli {
     fn color(&self) -> bool {
         !self.no_color && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+    }
+
+    fn show_progress(&self) -> bool {
+        !self.quiet
+            && !self.dry_run
+            && match self.progress {
+                ProgressMode::Auto => std::io::stderr().is_terminal(),
+                ProgressMode::Always => true,
+                ProgressMode::Never => false,
+            }
     }
 
     fn report(&self, line: &str, ok: bool) {
@@ -123,11 +154,7 @@ fn run() -> Result<()> {
     }
     let cli = Cli::parse();
     if cli.version {
-        println!(
-            "Mighty Copy with Hash\nCopyright (C) 2026 Olize\n{}",
-            env!("CARGO_PKG_VERSION")
-        );
-        return Ok(());
+        anyhow::bail!("-v/--version must be used alone; no files were copied");
     }
 
     if !cli.quiet {
@@ -145,6 +172,18 @@ fn run() -> Result<()> {
     }
     if cli.only_src_content && cli.sources.len() != 1 {
         anyhow::bail!("-O/--only-src-content requires exactly one source directory");
+    }
+    if cli.resume {
+        if cli.no_hash {
+            anyhow::bail!("--resume requires hash verification; remove -N/--no-hash");
+        }
+        if cli.sources.len() != 1 || cli.only_src_content || cli.count != 1 {
+            anyhow::bail!(
+                "--resume currently supports exactly one regular source file, --count 1, without -O"
+            );
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("--resume is not yet supported on this platform");
     }
     let plan = engine::build_plan(&cli, &cli.destination)?;
     engine::execute(&cli, &plan)
