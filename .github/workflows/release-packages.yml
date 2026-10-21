@@ -43,6 +43,7 @@ jobs:
           git merge-base --is-ancestor "$sha" origin/main || { echo "Tag is not on public main"; exit 1; }
           version="$(git show "$sha:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -n1)"
           [[ "$TAG" == "v$version" ]] || { echo "Tag and Cargo version mismatch"; exit 1; }
+          [[ "$TAG" != v0.2.1 ]] || { echo 'Historical v0.2.1 assets must remain immutable; ARM64 archives begin with a future release'; exit 1; }
           [[ "$(gh release view "$TAG" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease')" == false ]] || { echo "Release must be published and stable"; exit 1; }
           [[ "$(gh release view "$TAG" --json tagName --jq .tagName)" == "$TAG" ]] || { echo "Release tag identity mismatch"; exit 1; }
           printf 'tag=%s\nsha=%s\n' "$TAG" "$sha" >> "$GITHUB_OUTPUT"
@@ -66,6 +67,14 @@ jobs:
             platform: linux-x86_64
             target: x86_64-unknown-linux-gnu
             binary: mch
+          - runner: ubuntu-22.04-arm
+            platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            binary: mch
+          - runner: ubuntu-24.04
+            platform: android-aarch64-termux
+            target: aarch64-linux-android
+            binary: mch
     runs-on: ${{ matrix.runner }}
     env:
       TAG: ${{ needs.verify.outputs.tag }}
@@ -83,17 +92,46 @@ jobs:
         run: |
           set -euo pipefail
           host="$(rustc -vV | sed -n 's/^host: //p')"
-          [[ "$host" == "$TARGET" ]] || { echo "Wrong native architecture: $host"; exit 1; }
-          if [[ "$PLATFORM" == macos-aarch64 ]]; then
-            [[ "$(uname -m)" == arm64 ]] || { echo "Not an Apple Silicon machine"; exit 1; }
-          fi
           rustup target add "$TARGET"
+          if [[ "$PLATFORM" == android-aarch64-termux ]]; then
+            [[ "$host" == x86_64-unknown-linux-gnu ]] || { echo "Expected x86_64 Linux cross-build host"; exit 1; }
+            test -n "$ANDROID_NDK_HOME"
+            linker="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+            test -x "$linker"
+            export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$linker"
+            export CC_aarch64_linux_android="$linker"
+            ar="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+            test -x "$ar"
+            export AR_aarch64_linux_android="$ar"
+          else
+            [[ "$host" == "$TARGET" ]] || { echo "Wrong native architecture: $host"; exit 1; }
+            if [[ "$PLATFORM" == macos-aarch64 ]]; then
+              [[ "$(uname -m)" == arm64 ]] || { echo "Not an Apple Silicon machine"; exit 1; }
+            fi
+            if [[ "$PLATFORM" == linux-aarch64 ]]; then
+              [[ "$(uname -m)" == aarch64 ]] || { echo "Not a Linux ARM64 machine"; exit 1; }
+            fi
+          fi
           cargo test --locked
           cargo build --release --locked --target "$TARGET"
-          test -s "target/$TARGET/release/$BINARY"
+          binary="target/$TARGET/release/$BINARY"
+          test -s "$binary"
           version="$(printf '%s' "$TAG" | cut -c2-)"
-          actual="$( "target/$TARGET/release/$BINARY" -v | tail -n1 | tr -d '\r' )"
-          [[ "$actual" == "$version" ]] || { echo "Wrong executable version: $actual"; exit 1; }
+          if [[ "$PLATFORM" == android-aarch64-termux ]]; then
+            readelf -h "$binary" | grep -Eq 'Machine:[[:space:]]+AArch64'
+            readelf -l "$binary" | grep -F '/system/bin/linker64'
+            if readelf -d "$binary" | grep -E 'libc\.so\.6|ld-linux'; then
+              echo 'Refusing glibc-linked binary in Termux archive' >&2
+              exit 1
+            fi
+            echo 'Cross-build: native Termux execution tests are a separate release gate'
+          else
+            if [[ "$PLATFORM" == linux-aarch64 ]]; then
+              readelf -h "$binary" | grep -Eq 'Machine:[[:space:]]+AArch64'
+            fi
+            actual="$( "$binary" -v | tail -n1 | tr -d '\r' )"
+            [[ "$actual" == "$version" ]] || { echo "Wrong executable version: $actual"; exit 1; }
+          fi
       - name: Package executable with license and README
         shell: bash
         run: |
@@ -179,9 +217,11 @@ jobs:
               f"mch-{tag}-windows-x86_64.zip",
               f"mch-{tag}-macos-aarch64.tar.gz",
               f"mch-{tag}-linux-x86_64.tar.gz",
+              f"mch-{tag}-linux-aarch64.tar.gz",
+              f"mch-{tag}-android-aarch64-termux.tar.gz",
           }
           found = {p.name for p in folder.iterdir() if p.is_file()}
-          assert found == expected, f"Expected five archives, got: {found}"
+          assert found == expected, f"Expected seven archives, got: {found}"
           for filename in sorted(expected):
               file = folder / filename
               assert file.stat().st_size > 1000, f"Archive is empty: {filename}"
@@ -211,5 +251,5 @@ jobs:
           set -euo pipefail
           gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
           count="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
-          [[ "$count" -eq 6 ]] || { echo "Expected six release assets, found $count"; exit 1; }
+          [[ "$count" -eq 8 ]] || { echo "Expected eight release assets, found $count"; exit 1; }
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name]'

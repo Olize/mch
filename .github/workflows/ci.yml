@@ -32,3 +32,58 @@ jobs:
         run: cargo test --locked
       - name: Release build
         run: cargo build --release --locked
+
+  linux-aarch64:
+    name: Test and build (linux-aarch64)
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Validate Linux AArch64 natively
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == aarch64 ]]
+          [[ "$(rustc -vV | sed -n 's/^host: //p')" == aarch64-unknown-linux-gnu ]]
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo build --release --locked
+          readelf -h target/release/mch | grep -Eq 'Machine:[[:space:]]+AArch64'
+          target/release/mch -v
+
+  termux-aarch64:
+    name: Cross-build (android-aarch64-termux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: android-aarch64-ndk
+      - name: Cross-build and validate Android Bionic ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_NDK_HOME"
+          ndk_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$ndk_bin/aarch64-linux-android24-clang"
+          test -x "$ndk_bin/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ndk_bin/aarch64-linux-android24-clang"
+          export CC_aarch64_linux_android="$ndk_bin/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$ndk_bin/llvm-ar"
+          cargo build --release --locked --target aarch64-linux-android
+          binary=target/aarch64-linux-android/release/mch
+          test -s "$binary"
+          readelf -h "$binary" | grep -Eq 'Machine:[[:space:]]+AArch64'
+          readelf -l "$binary" | grep -F '/system/bin/linker64'
+          if readelf -d "$binary" | grep -E 'libc\.so\.6|ld-linux'; then
+            echo 'Refusing glibc-linked binary' >&2
+            exit 1
+          fi
+          sha256sum "$binary"
