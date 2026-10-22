@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 — 2026-10-22
+
+- Add separate official release archives for Linux AArch64 (GNU/glibc) and native Android/Termux AArch64 (Bionic), with binary ABI checks and SHA-256 sums for all downloads.
+- Continue packaging native Linux x86_64, macOS Apple Silicon and Windows x86_64 binaries and reproducible tagged source snapshots.
+- No changes to the reviewed v0.2.1 single-file Unix \`--resume\` runtime. Windows single-file resume remains unsupported.
+- Multi-file \`--resume-dir\` is **not** part of this release: its active-adversary and power-loss security review is incomplete, so it is excluded from the stable binaries and source archives.
+- Packaged programs are not code-signed or notarized; validate hashes and use only on supported platforms.
+
 ## 0.2.1 — 2026-10-21
 
 - Enforce no-overwrite at commit time on Linux/Android with RENAME_NOREPLACE, and otherwise safe no-replace hard-link publication.

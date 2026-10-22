@@ -2,7 +2,7 @@
 
 **MCH** is a Rust command-line tool for copying or moving local files and directory trees with optional post-copy integrity verification. Its default hash is **BLAKE3**.
 
-Current version: **0.2.1**. Licensed under **GNU AGPL-3.0-or-later**.
+Current version: **0.2.2**. Licensed under **GNU AGPL-3.0-or-later**.
 
 ## Features
 
@@ -21,7 +21,9 @@ Current version: **0.2.1**. Licensed under **GNU AGPL-3.0-or-later**.
 
 ## Install
 
-Requires the Rust toolchain with Cargo.
+Version 0.2.2 adds separate downloadable Linux AArch64 and native Android/Termux AArch64 binaries alongside Linux x86_64, Windows x86_64 and macOS Apple Silicon. See the [GitHub Releases](https://github.com/Olize/mch/releases) page for the package matching your architecture and verify it against \`SHA256SUMS.txt\` before use. **Linux AArch64 (glibc) is not a Termux binary**; Android/Termux requires the \`android-aarch64-termux\` archive with the Android Bionic linker.
+
+To build from source instead, the Rust toolchain with Cargo is required.
 
 ```bash
 git clone https://github.com/Olize/mch.git
