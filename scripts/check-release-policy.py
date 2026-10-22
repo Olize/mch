@@ -18,6 +18,10 @@ check("gh release upload \"$TAG\" dist/*" in workflow, "expected upload")
 check(not re.search(r'^\s*gh release upload[^\n]*--clobber', workflow, re.M), "no clobber")
 check('gh release edit "$TAG"' in workflow and "--draft=false" in workflow, "publish verified draft")
 check('uploaded[name].get("digest")' in workflow, "verify remote SHA256 digests")
+check('"isDraft,assets"' in workflow and '["gh", "release", "view"' in workflow,
+      "draft-aware asset inspection; REST by-tag omits drafts")
+check("Remote tag moved after validation" in workflow and "Remote tag changed before publication" in workflow,
+      "compare peeled remote tag with pinned verified commit before draft and publish")
 check('".immutable"' in workflow or ".immutable)" in workflow or "--jq .immutable" in workflow, "check immutable")
 check("Already published; refusing replacement" in workflow, "refuse published tag")
 check("Historical tag: refuse rebuild" in workflow, "no historical rebuilds")

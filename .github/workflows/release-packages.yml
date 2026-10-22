@@ -197,6 +197,7 @@ jobs:
       contents: write
     env:
       TAG: ${{ needs.verify.outputs.tag }}
+      RELEASE_SHA: ${{ needs.verify.outputs.sha }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -255,6 +256,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Tag immutability begins only on publication. Guard against
+          # a force-moved tag while the platform build jobs were running.
+          object_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.type)"
+          remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)"
+          if [[ "$object_type" == tag ]]; then
+            remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$remote_sha" --jq .object.sha)"
+          else
+            [[ "$object_type" == commit ]] || { echo "Unsupported tag target"; exit 1; }
+          fi
+          [[ "$remote_sha" == "$RELEASE_SHA" ]] || { echo "Remote tag moved after validation"; exit 1; }
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft > /tmp/mch-draft 2>/dev/null; then
             [[ "$(cat /tmp/mch-draft)" == true ]] || { echo "Refusing published release"; exit 1; }
             [[ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')" -eq 0 ]] || { echo "Draft already contains assets"; exit 1; }
@@ -278,8 +289,11 @@ jobs:
           import subprocess
           repo = os.environ["GITHUB_REPOSITORY"]
           tag = os.environ["TAG"]
-          release = json.loads(subprocess.check_output(["gh", "api", f"repos/{repo}/releases/tags/{tag}"], text=True))
-          assert release["draft"] is True, "Release was published before asset verification"
+          # GitHub's by-tag REST endpoint omits unpublished drafts.
+          # The gh release view command uses draft-aware GraphQL instead.
+          release = json.loads(subprocess.check_output(
+              ["gh", "release", "view", tag, "--repo", repo, "--json", "isDraft,assets"], text=True))
+          assert release["isDraft"] is True, "Release was published before asset verification"
           local = {p.name: p for p in Path("dist").iterdir() if p.is_file()}
           uploaded = {a["name"]: a for a in release["assets"]}
           assert local.keys() == uploaded.keys() and len(local) == 8, "Release assets differ"
@@ -292,6 +306,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Independently verify tag identity AGAIN immediately before sealing.
+          object_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.type)"
+          remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)"
+          if [[ "$object_type" == tag ]]; then
+            remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$remote_sha" --jq .object.sha)"
+          else
+            [[ "$object_type" == commit ]] || { echo "Unsupported tag target"; exit 1; }
+          fi
+          [[ "$remote_sha" == "$RELEASE_SHA" ]] || { echo "Remote tag changed before publication"; exit 1; }
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
           sealed="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable)"
           [[ "$sealed" == true ]] || { echo "CRITICAL: published release is NOT immutable"; exit 1; }
