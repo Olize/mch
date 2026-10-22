@@ -1,25 +1,21 @@
 name: Release packages
 
+# Trigger on the NEW tag; create a draft, attach all assets, then publish.
+# Never rebuild immutable published releases or replace any downloaded asset.
 on:
-  release:
-    types: [published]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing stable release tag, e.g. v0.2.1"
-        required: true
-        type: string
+  push:
+    tags: ['v[0-9]*']
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-packages-${{ github.event.release.tag_name || inputs.tag }}
+  group: release-packages-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   verify:
-    name: Validate published tag
+    name: Validate new stable tag
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.guard.outputs.tag }}
@@ -30,10 +26,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - id: guard
-        name: Check tag, version, repository history and published release
+        name: Check tag, main ancestry and nonpublished draft
         shell: bash
         env:
-          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -43,9 +39,17 @@ jobs:
           git merge-base --is-ancestor "$sha" origin/main || { echo "Tag is not on public main"; exit 1; }
           version="$(git show "$sha:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -n1)"
           [[ "$TAG" == "v$version" ]] || { echo "Tag and Cargo version mismatch"; exit 1; }
-          [[ "$TAG" != v0.2.1 ]] || { echo 'Historical v0.2.1 assets must remain immutable; ARM64 archives begin with a future release'; exit 1; }
-          [[ "$(gh release view "$TAG" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease')" == false ]] || { echo "Release must be published and stable"; exit 1; }
-          [[ "$(gh release view "$TAG" --json tagName --jq .tagName)" == "$TAG" ]] || { echo "Release tag identity mismatch"; exit 1; }
+          # Deny all historical 0.2.0–0.2.2 rebuilds, even via a moved tag.
+          python3 - "$version" <<'VERSION_GUARD'
+          import sys
+          version = tuple(map(int, sys.argv[1].split(".")))
+          if version < (0, 2, 3):
+              raise SystemExit("Historical tag: refuse rebuild")
+          VERSION_GUARD
+          if gh release view "$TAG" --json isDraft --jq .isDraft > /tmp/mch-draft-status 2>/dev/null; then
+            [[ "$(cat /tmp/mch-draft-status)" == true ]] || { echo "Already published; refusing replacement"; exit 1; }
+            [[ "$(gh release view "$TAG" --json assets --jq '.assets | length')" -eq 0 ]] || { echo "Draft contains assets: manual review required"; exit 1; }
+          fi
           printf 'tag=%s\nsha=%s\n' "$TAG" "$sha" >> "$GITHUB_OUTPUT"
 
   binary:
@@ -87,6 +91,8 @@ jobs:
           ref: ${{ needs.verify.outputs.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: "1.99.1"
       - name: Assert native architecture, test and build
         shell: bash
         run: |
@@ -245,11 +251,50 @@ jobs:
                   out.write(f"{digest}  {filename}\n")
           print((folder / "SHA256SUMS.txt").read_text())
           PY
-      - name: Upload to the existing published GitHub release
+      - name: Open empty draft; fail on existing published release or assets
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft > /tmp/mch-draft 2>/dev/null; then
+            [[ "$(cat /tmp/mch-draft)" == true ]] || { echo "Refusing published release"; exit 1; }
+            [[ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')" -eq 0 ]] || { echo "Draft already contains assets"; exit 1; }
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "MCH $TAG" --notes "Stable MCH $TAG release. See CHANGELOG.md and verify download checksums."
+          fi
+      - name: Upload verified assets into empty draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
+      - name: Independently confirm all eight uploaded SHA-256 digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["TAG"]
+          release = json.loads(subprocess.check_output(["gh", "api", f"repos/{repo}/releases/tags/{tag}"], text=True))
+          assert release["draft"] is True, "Release was published before asset verification"
+          local = {p.name: p for p in Path("dist").iterdir() if p.is_file()}
+          uploaded = {a["name"]: a for a in release["assets"]}
+          assert local.keys() == uploaded.keys() and len(local) == 8, "Release assets differ"
+          for name, path in sorted(local.items()):
+              digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+              assert uploaded[name].get("digest") == digest, f"Hash mismatch: {name}"
+          print("All eight uploaded assets match verified local SHA256")
+          PY
+      - name: Publish verified draft and REQUIRE GitHub immutability
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          sealed="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable)"
+          [[ "$sealed" == true ]] || { echo "CRITICAL: published release is NOT immutable"; exit 1; }
           count="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
-          [[ "$count" -eq 8 ]] || { echo "Expected eight release assets, found $count"; exit 1; }
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name]'
+          [[ "$count" -eq 8 ]] || { echo "Expected eight immutable release assets"; exit 1; }
+          echo "Published $TAG: eight verified immutable assets"
