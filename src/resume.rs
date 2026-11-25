@@ -13,6 +13,7 @@ pub(crate) fn copy(
     _source: &Path,
     _destination: &Path,
     _source_times: Option<(FileTime, FileTime)>,
+    _overwrite_target: Option<&crate::engine::OverwriteTarget>,
 ) -> Result<()> {
     bail!("--resume is not supported on this platform")
 }
@@ -302,6 +303,7 @@ mod unix {
         source: &Path,
         destination: &Path,
         source_times: Option<(FileTime, FileTime)>,
+        overwrite_target: Option<&crate::engine::OverwriteTarget>,
     ) -> Result<()> {
         let initial_meta = fs::symlink_metadata(source)
             .with_context(|| format!("stat source {}", source.display()))?;
@@ -390,7 +392,8 @@ mod unix {
         stage.sync_all().context("sync private staged metadata")?;
         crate::engine::check_destination_file(source, destination, cli.overwrite)?;
         inode_unchanged(&stage, &partial_path)?;
-        crate::engine::publish_stage(&partial_path, destination, cli.overwrite)
+        let replace = crate::engine::may_replace(overwrite_target, destination)?;
+        crate::engine::publish_stage(&partial_path, destination, replace)
             .context("publish fully verified resumed copy")?;
         // The inode is now the FINAL destination, not a resumable .part.
         // Set permissions via the already-open handle, avoiding a pathname
@@ -401,7 +404,6 @@ mod unix {
         stage
             .sync_all()
             .context("sync final resumed file permissions")?;
-        drop(stage);
         // A synced file alone does not durably record a published directory
         // entry. Sync the directory on every overwrite, even without --move.
         // Moving also requires the sync before the source may be deleted.
@@ -441,6 +443,9 @@ mod unix {
             eprintln!("RESUME HASH VERIFIED: {} complete", cli.hash.label());
         }
         if cli.move_mode {
+            inode_unchanged(&stage, destination)
+                .context("published resume destination changed before source removal")?;
+            require_original_source(source, &src, &initial_meta)?;
             fs::remove_file(source)
                 .with_context(|| format!("remove verified moved source {}", source.display()))?;
             cli.report(&format!("MOVED {}", source.display()), true);

@@ -1,6 +1,6 @@
 [package]
 name = "mch"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Mighty Copy with Hash (mch) - copy/move with post-copy verification (default: BLAKE3)."
@@ -8,8 +8,7 @@ repository = "https://github.com/Olize/mch"
 readme = "README.md"
 
 [package.metadata.mch-release]
-# Explicit review decision; automatic version bump alone must not publish resume.
-approved_unix_resume = "v1-single-regular-file-reviewed-0.2.2-platform-only"
+approved_unix_resume = "v1-single-regular-file-reviewed-0.2.3-move-safety"
 
 [dependencies]
 anyhow = "1"
@@ -24,8 +23,12 @@ hex = "0.4"
 
 rayon = "1"
 filetime = "0.2.29"
+unicode-normalization = "0.1.24"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"

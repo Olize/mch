@@ -1,15 +1,127 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use crate::{Cli, hashing::hash_file, progress::Progress};
+#[cfg(all(unix, any(target_os = "macos", test)))]
+use anyhow::ensure;
 use anyhow::{Context, Result, anyhow, bail};
 use filetime::FileTime;
 use rayon::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+#[cfg(all(unix, any(target_os = "macos", test)))]
+use std::io::{Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use unicode_normalization::UnicodeNormalization;
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum WindowsFileIdentity {
+    Full(u64, [u8; 16]),
+    Legacy(u32, u64),
+    FatVolumeRoot(u32),
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> Result<WindowsFileIdentity> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, VOLUME_NAME_GUID,
+    };
+
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("open Windows file identity {}", path.display()))?;
+    let handle = file.as_raw_handle();
+    let mut full = FILE_ID_INFO::default();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&raw mut full).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok != 0 && full.FileId.Identifier != [0; 16] {
+        return Ok(WindowsFileIdentity::Full(
+            full.VolumeSerialNumber,
+            full.FileId.Identifier,
+        ));
+    }
+
+    // ReFS requires the full 128-bit identity. Permit legacy indices only on
+    // known filesystems where the 64-bit interface applies.
+    let mut name = [0u16; 32];
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            handle,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("query filesystem for legacy Windows identity");
+    }
+    let end = name.iter().position(|c| *c == 0).unwrap_or(name.len());
+    let name = String::from_utf16_lossy(&name[..end]).to_ascii_uppercase();
+    if !matches!(name.as_str(), "NTFS" | "FAT" | "FAT32" | "EXFAT") {
+        bail!(
+            "filesystem requires an available 128-bit Windows file identity: {}",
+            path.display()
+        );
+    }
+    let mut old = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(handle, &mut old) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("query legacy Windows file identity");
+    }
+    let index = (u64::from(old.nFileIndexHigh) << 32) | u64::from(old.nFileIndexLow);
+    if index == 0 {
+        // FAT roots have no parent directory entry. Only a handle that the
+        // kernel resolves to the actual volume root may use this identity.
+        if matches!(name.as_str(), "FAT" | "FAT32" | "EXFAT") {
+            let mut final_path = [0u16; 64];
+            let length = unsafe {
+                GetFinalPathNameByHandleW(
+                    handle,
+                    final_path.as_mut_ptr(),
+                    final_path.len() as u32,
+                    VOLUME_NAME_GUID,
+                )
+            } as usize;
+            if length > 0 && length < final_path.len() {
+                let path = String::from_utf16_lossy(&final_path[..length]);
+                if let Some(guid) = path
+                    .strip_prefix(r"\\?\Volume{")
+                    .and_then(|tail| tail.strip_suffix("}\\"))
+                    && guid.len() == 36
+                    && guid.bytes().enumerate().all(|(i, b)| match i {
+                        8 | 13 | 18 | 23 => b == b'-',
+                        _ => b.is_ascii_hexdigit(),
+                    })
+                {
+                    return Ok(WindowsFileIdentity::FatVolumeRoot(old.dwVolumeSerialNumber));
+                }
+            }
+        }
+        bail!(
+            "Windows filesystem returned an empty file identity: {}",
+            path.display()
+        );
+    }
+    Ok(WindowsFileIdentity::Legacy(old.dwVolumeSerialNumber, index))
+}
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -20,12 +132,58 @@ enum Kind {
     Symlink,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OverwriteTarget {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    identity: WindowsFileIdentity,
+}
+
+impl OverwriteTarget {
+    fn capture(_path: &Path, meta: &fs::Metadata) -> Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            len: meta.len(),
+            modified: meta.modified()?,
+            #[cfg(unix)]
+            device: meta.dev(),
+            #[cfg(unix)]
+            inode: meta.ino(),
+            #[cfg(windows)]
+            identity: windows_file_identity(_path)?,
+        })
+    }
+}
+
+// An absent target always uses the OS no-replace operation. An existing
+// target must still match the entry observed when the plan was built.
+pub(crate) fn may_replace(planned: Option<&OverwriteTarget>, path: &Path) -> Result<bool> {
+    let Some(planned) = planned else {
+        return Ok(false);
+    };
+    let current = fs::symlink_metadata(path)
+        .with_context(|| format!("planned overwrite target disappeared: {}", path.display()))?;
+    if OverwriteTarget::capture(path, &current)? != *planned {
+        bail!("planned overwrite target changed: {}", path.display());
+    }
+    Ok(true)
+}
+
 struct FileTask {
     source: PathBuf,
     destination: PathBuf,
     kind: Kind,
+    overwrite_target: Option<OverwriteTarget>,
     source_times: Option<(FileTime, FileTime)>,
     move_identity: Option<fs::Metadata>,
+    #[cfg(windows)]
+    move_windows_identity: Option<WindowsFileIdentity>,
 }
 
 struct DirTask {
@@ -35,6 +193,8 @@ struct DirTask {
     source_atime: FileTime,
     source_mtime: FileTime,
     move_identity: Option<fs::Metadata>,
+    #[cfg(windows)]
+    move_windows_identity: Option<WindowsFileIdentity>,
 }
 
 pub(crate) struct Plan {
@@ -51,15 +211,26 @@ fn absolute(path: &Path) -> Result<PathBuf> {
         std::env::current_dir()?.join(path)
     };
     let mut result = PathBuf::new();
+    let mut crossed_symlink = false;
     for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
+                // Lexical .. is NOT the kernel's .. after traversing a symlink.
+                // Refuse ambiguity rather than moving a different source.
+                if crossed_symlink {
+                    bail!("unsafe .. after symbolic link: {}", path.display());
+                }
                 if !result.pop() {
                     bail!("path escapes root: {}", path.display());
                 }
             }
-            Component::Normal(part) => result.push(part),
+            Component::Normal(part) => {
+                result.push(part);
+                if existing_metadata(&result)?.is_some_and(|meta| meta.file_type().is_symlink()) {
+                    crossed_symlink = true;
+                }
+            }
             Component::RootDir | Component::Prefix(_) => result.push(component.as_os_str()),
         }
     }
@@ -155,7 +326,18 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<()> {
             .ok_or_else(|| anyhow!("no directory ancestor: {}", path.display()))?;
     }
     for directory in missing.iter().rev() {
-        match fs::create_dir(directory) {
+        // Never expose a private 0700 source tree at 0755 during a
+        // partially completed copy or after a crash.
+        #[cfg(unix)]
+        let created = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(directory)
+        };
+        #[cfg(not(unix))]
+        let created = fs::create_dir(directory);
+        match created {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
             Err(error) => {
@@ -177,14 +359,21 @@ pub(crate) fn check_destination_file(
     source: &Path,
     destination: &Path,
     overwrite: bool,
-) -> Result<()> {
+) -> Result<Option<fs::Metadata>> {
     no_symlink_parents(destination)?;
-    match existing_metadata(destination)? {
+    let existing = existing_metadata(destination)?;
+    match &existing {
         Some(meta) if meta.is_dir() => {
             bail!(
                 "cannot replace a directory with a file: {}",
                 destination.display()
             )
+        }
+        Some(meta) if !meta.is_file() && !meta.file_type().is_symlink() => {
+            bail!(
+                "refusing to replace a special destination: {}",
+                destination.display()
+            );
         }
         Some(_) if !overwrite => {
             bail!(
@@ -213,7 +402,7 @@ pub(crate) fn check_destination_file(
         }
         None => {}
     }
-    Ok(())
+    Ok(existing)
 }
 
 fn register_file(plan: &mut Plan, source: &Path, target: &Path, kind: Kind) {
@@ -221,8 +410,11 @@ fn register_file(plan: &mut Plan, source: &Path, target: &Path, kind: Kind) {
         source: source.to_path_buf(),
         destination: target.to_path_buf(),
         kind,
+        overwrite_target: None,
         source_times: None,
         move_identity: None,
+        #[cfg(windows)]
+        move_windows_identity: None,
     });
 }
 
@@ -243,6 +435,8 @@ fn collect_directory(plan: &mut Plan, source: &Path, destination: &Path) -> Resu
         source_atime: FileTime::from_last_access_time(&source_meta),
         source_mtime: FileTime::from_last_modification_time(&source_meta),
         move_identity: None,
+        #[cfg(windows)]
+        move_windows_identity: None,
     });
 
     let mut entries = fs::read_dir(source)
@@ -270,6 +464,66 @@ fn collect_directory(plan: &mut Plan, source: &Path, destination: &Path) -> Resu
             );
         } else {
             bail!("unsupported special file: {}", source_path.display());
+        }
+    }
+    Ok(())
+}
+
+// Preserve opaque OS filename bytes. Only valid Unicode spans participate
+// in normalization, including when a different component is not UTF-8.
+fn folded_destination_key(path: &Path) -> Vec<u8> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let mut key = Vec::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        let lowercase = chunk.valid().nfc().collect::<String>().to_lowercase();
+        key.extend_from_slice(lowercase.nfc().collect::<String>().as_bytes());
+        key.extend_from_slice(chunk.invalid());
+    }
+    key
+}
+
+#[cfg(unix)]
+fn directory_identity(_path: &Path, meta: &fs::Metadata) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Ok((meta.dev(), meta.ino()))
+}
+
+#[cfg(windows)]
+fn directory_identity(path: &Path, _meta: &fs::Metadata) -> Result<WindowsFileIdentity> {
+    windows_file_identity(path)
+}
+
+#[cfg(any(unix, windows))]
+fn reject_destinations_in_source_trees(plan: &Plan) -> Result<()> {
+    if plan.directories.is_empty() {
+        return Ok(());
+    }
+    let mut source_dirs = HashSet::new();
+    for dir in &plan.directories {
+        source_dirs.insert(directory_identity(
+            &dir.source,
+            &fs::symlink_metadata(&dir.source)?,
+        )?);
+    }
+    // File targets can have an existing ancestor inside a different source,
+    // even when the target itself does not exist yet. Inspect each parent once.
+    let directories = plan.directories.iter().map(|d| d.destination.as_path());
+    let parents = plan.files.iter().filter_map(|f| f.destination.parent());
+    let mut inspected = HashSet::new();
+    for dir in directories.chain(parents) {
+        for path in dir.ancestors() {
+            if !inspected.insert(path) {
+                break;
+            }
+            if let Some(meta) = existing_metadata(path)?
+                && meta.is_dir()
+                && source_dirs.contains(&directory_identity(path, &meta)?)
+            {
+                bail!(
+                    "a planned destination lies inside a source directory: {}",
+                    path.display()
+                );
+            }
         }
     }
     Ok(())
@@ -332,14 +586,7 @@ pub(crate) fn build_plan(cli: &Cli, destination: &Path) -> Result<Plan> {
             || destination_is_directory
             || explicit_directory
         {
-            if kind.is_dir()
-                && (plan.sources.len() == 1 || destination_is_directory || explicit_directory)
-            {
-                // Existing CLI semantics: directory always lands inside destination/basename.
-                dest.join(name)
-            } else {
-                dest.join(name)
-            }
+            dest.join(name)
         } else {
             dest.clone()
         };
@@ -372,7 +619,26 @@ pub(crate) fn build_plan(cli: &Cli, destination: &Path) -> Result<Plan> {
 
     let mut targets = HashSet::new();
     let mut directory_targets = HashSet::new();
+    let mut folded_targets = HashMap::<Vec<u8>, PathBuf>::new();
+    // NFC also catches canonically equivalent Unicode names (e.g. macOS
+    // decomposed filenames). This remains conservative and is NOT a proof
+    // of every filesystem's case-folding and normalization behavior.
+    // Move targets are independently reverified before source deletion.
+    let mut check_folded = |target: &Path| -> Result<()> {
+        let folded = folded_destination_key(target);
+        if let Some(other) = folded_targets.insert(folded, target.to_path_buf())
+            && other != target
+        {
+            bail!(
+                "ambiguous case-insensitive destination collision (including Unicode-normalized destination collision): {} and {}",
+                other.display(),
+                target.display()
+            );
+        }
+        Ok(())
+    };
     for dir in &plan.directories {
+        check_folded(&dir.destination)?;
         if !directory_targets.insert(dir.destination.clone()) {
             bail!(
                 "multiple sources target the same directory: {}",
@@ -380,7 +646,8 @@ pub(crate) fn build_plan(cli: &Cli, destination: &Path) -> Result<Plan> {
             );
         }
     }
-    for task in &plan.files {
+    for task in &mut plan.files {
+        check_folded(&task.destination)?;
         if !targets.insert(task.destination.clone()) {
             bail!(
                 "multiple sources target the same file: {}",
@@ -393,7 +660,10 @@ pub(crate) fn build_plan(cli: &Cli, destination: &Path) -> Result<Plan> {
                 task.destination.display()
             );
         }
-        check_destination_file(&task.source, &task.destination, cli.overwrite)?;
+        if let Some(meta) = check_destination_file(&task.source, &task.destination, cli.overwrite)?
+        {
+            task.overwrite_target = Some(OverwriteTarget::capture(&task.destination, &meta)?);
+        }
         if matches!(task.kind, Kind::Regular) {
             let size = fs::metadata(&task.source)
                 .with_context(|| format!("read file size: {}", task.source.display()))?
@@ -404,11 +674,52 @@ pub(crate) fn build_plan(cli: &Cli, destination: &Path) -> Result<Plan> {
                 .context("total source size exceeds u64 range")?;
         }
     }
+    #[cfg(any(unix, windows))]
+    reject_destinations_in_source_trees(&plan)?;
+    // A different worker can still need an existing destination as its input.
+    // Check the whole plan before creating directories or publishing the first file.
+    #[cfg(any(unix, windows))]
+    if plan
+        .files
+        .iter()
+        .any(|task| task.overwrite_target.is_some())
+    {
+        let mut inputs = HashSet::new();
+        for task in &plan.files {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let meta = fs::symlink_metadata(&task.source)?;
+                inputs.insert((meta.dev(), meta.ino()));
+            }
+            #[cfg(windows)]
+            inputs.insert(windows_file_identity(&task.source)?);
+        }
+        for task in &plan.files {
+            if let Some(target) = &task.overwrite_target {
+                #[cfg(unix)]
+                let id = (target.device, target.inode);
+                #[cfg(windows)]
+                let id = target.identity;
+                if inputs.contains(&id) {
+                    bail!(
+                        "planned overwrite would replace a source in this transfer: {}",
+                        task.destination.display()
+                    );
+                }
+            }
+        }
+    }
     // Detect file paths that would become parents of any planned target.
     for dir in &plan.directories {
         if targets.contains(&dir.destination) {
             bail!("directory/file conflict: {}", dir.destination.display());
         }
+    }
+    // Keep the Windows multi-file move/overwrite restriction for this release.
+    #[cfg(windows)]
+    if cli.move_mode && cli.overwrite && plan.files.len() > 1 {
+        bail!("multi-file --move --overwrite is temporarily disabled on Windows for data safety");
     }
     if cli.move_mode {
         // Save source identities before any copying. Files are never deleted
@@ -418,12 +729,20 @@ pub(crate) fn build_plan(cli: &Cli, destination: &Path) -> Result<Plan> {
                 fs::symlink_metadata(&task.source)
                     .with_context(|| format!("snapshot move source {}", task.source.display()))?,
             );
+            #[cfg(windows)]
+            {
+                task.move_windows_identity = Some(windows_file_identity(&task.source)?);
+            }
         }
         for directory in &mut plan.directories {
             directory.move_identity =
                 Some(fs::symlink_metadata(&directory.source).with_context(|| {
                     format!("snapshot move directory {}", directory.source.display())
                 })?);
+            #[cfg(windows)]
+            {
+                directory.move_windows_identity = Some(windows_file_identity(&directory.source)?);
+            }
         }
     }
     if cli.preserve_times {
@@ -452,7 +771,7 @@ impl Drop for TempPath {
 fn reserve_private_stage(path: &Path) -> Result<fs::File> {
     // The temporary inode starts as 0600 even when the user's umask is 022.
     let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -463,20 +782,108 @@ fn reserve_private_stage(path: &Path) -> Result<fs::File> {
         .with_context(|| format!("reserve temporary file {}", path.display()))
 }
 
-fn new_temp_path(destination: &Path) -> Result<TempPath> {
+fn new_temp_path(destination: &Path) -> Result<PathBuf> {
     let parent = destination.parent().context("destination has no parent")?;
     let index = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    Ok(TempPath(
-        parent.join(format!(".mch-tmp-{}-{index}", std::process::id())),
-    ))
+    Ok(parent.join(format!(".mch-tmp-{}-{index}", std::process::id())))
 }
 
 // Enforce no-overwrite *at publication*, not only with a preflight check.
-// Creating the final hard link is atomic and fails if any inode (including a
-// dangling symlink) appeared at the destination. Both names share one inode
-// briefly, then the temporary name is removed. Never fall back to rename:
-// rename would silently replace a concurrently created destination.
+// Prefer the OS-native exclusive rename (Linux/Android renameat2,
+// macOS renameatx_np, Windows MoveFileExW without REPLACE_EXISTING).
+// For older Linux and other Unix targets, hard-link publication is the
+// fail-closed fallback; never use a replacement-capable plain rename.
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn exclusive_nonatomic_copy(
+    pinned_stage: &fs::File,
+    stage_path: &Path,
+    destination: &Path,
+) -> Result<fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut input = pinned_stage
+        .try_clone()
+        .context("clone pinned staged inode")?;
+    ensure_regular_file(&input)?;
+    input.seek(SeekFrom::Start(0))?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true).mode(0o600);
+    // O_EXCL ensures a symlink or concurrently created target is NEVER
+    // followed or overwritten. The output is *visible while filling*.
+    let mut output = options.open(destination).with_context(|| {
+        format!(
+            "create exclusive non-atomic target {} (existing target is preserved)",
+            destination.display()
+        )
+    })?;
+    let copy_result = (|| -> Result<()> {
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        input.seek(SeekFrom::Start(0))?;
+        output.seek(SeekFrom::Start(0))?;
+        let mut source_buffer = vec![0_u8; 1024 * 1024];
+        let mut destination_buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let n = input.read(&mut source_buffer)?;
+            if n == 0 {
+                ensure!(
+                    output.read(&mut destination_buffer[..1])? == 0,
+                    "non-atomic destination has trailing bytes"
+                );
+                break;
+            }
+            output.read_exact(&mut destination_buffer[..n])?;
+            ensure!(
+                source_buffer[..n] == destination_buffer[..n],
+                "non-atomic destination content differs from verified stage"
+            );
+        }
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        return Err(error).with_context(|| format!(
+            "non-atomic publish FAILED for {}; destination may contain partial data, source is retained",
+            destination.display()
+        ));
+    }
+    let expected = pinned_stage.metadata()?;
+    let written = output.metadata()?;
+    ensure!(
+        expected.len() == written.len(),
+        "non-atomic output size mismatch; destination may be partial"
+    );
+    let current = fs::symlink_metadata(destination)?;
+    ensure!(
+        current.dev() == written.dev() && current.ino() == written.ino(),
+        "non-atomic destination was replaced concurrently; refusing success"
+    );
+    fs::remove_file(stage_path)?;
+    Ok(output)
+}
+
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn ensure_regular_file(fd: &fs::File) -> Result<()> {
+    anyhow::ensure!(
+        fd.metadata()?.is_file(),
+        "exclusive fallback requires a regular stage"
+    );
+    Ok(())
+}
+
+// Retain the original strict atomic contract for --resume and tests.
+#[cfg(any(unix, test))]
 pub(crate) fn publish_stage(stage: &Path, destination: &Path, overwrite: bool) -> Result<()> {
+    publish_stage_options(stage, destination, overwrite, false, None).map(|_| ())
+}
+
+// A successful macOS fallback returns the pinned destination inode. The
+// caller must apply permissions/timestamps to THIS descriptor, not the stage.
+fn publish_stage_options(
+    stage: &Path,
+    destination: &Path,
+    overwrite: bool,
+    _allow_nonatomic: bool,
+    _stage_fd: Option<&fs::File>,
+) -> Result<Option<fs::File>> {
     if !overwrite {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
@@ -499,7 +906,7 @@ pub(crate) fn publish_stage(stage: &Path, destination: &Path, overwrite: bool) -
                 )
             };
             if rc == 0 {
-                return Ok(());
+                return Ok(None);
             }
             let error = std::io::Error::last_os_error();
             // On older kernels or unsupported filesystems, try an equally
@@ -512,44 +919,108 @@ pub(crate) fn publish_stage(stage: &Path, destination: &Path, overwrite: bool) -
                     .with_context(|| format!("no-replace publish {}", destination.display()));
             }
         }
-        fs::hard_link(stage, destination).with_context(|| {
-            format!(
-                "destination appeared or filesystem does not support safe no-replace publish: {}",
-                destination.display()
-            )
-        })?;
-        fs::remove_file(stage)
-            .with_context(|| format!("remove published temporary name {}", stage.display()))?;
-        return Ok(());
+        #[cfg(target_os = "macos")]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let from =
+                CString::new(stage.as_os_str().as_bytes()).context("stage name contains a NUL")?;
+            let to = CString::new(destination.as_os_str().as_bytes())
+                .context("destination name contains a NUL")?;
+            // RENAME_EXCL is the Darwin equivalent of RENAME_NOREPLACE.
+            // Do not fall back to replacement-capable fs::rename.
+            let rc = unsafe {
+                libc::renameatx_np(
+                    libc::AT_FDCWD,
+                    from.as_ptr(),
+                    libc::AT_FDCWD,
+                    to.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            if rc != 0 {
+                let error = std::io::Error::last_os_error();
+                // No replacement-capable rename: ExFAT's FSKit implementation
+                // rejects RENAME_EXCL, and also has no hard links. The only
+                // portable exclusive creation is O_CREAT|O_EXCL. This option
+                // is *not atomic* for observers; user must explicitly opt in.
+                if _allow_nonatomic
+                    && matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL)
+                    )
+                {
+                    let fd = _stage_fd
+                        .context("non-atomic publish requires a pinned regular-file stage")?;
+                    return exclusive_nonatomic_copy(fd, stage, destination).map(Some);
+                }
+                return Err(error).with_context(|| format!(
+                    "exclusive publish {} (filesystem may not support atomic no-replace; --allow-nonatomic-publish opts into a non-atomic, verified copy that can leave a partial target on crash)",
+                    destination.display()
+                ));
+            }
+            return Ok(None);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn MoveFileExW(existing: *const u16, destination: *const u16, flags: u32) -> i32;
+            }
+            // std::fs canonicalization supplies a verbatim parent for long DOS
+            // and UNC paths. The final components must still refer to the named entries.
+            let parent = fs::canonicalize(stage.parent().context("stage has no parent")?)?;
+            let stage_name = parent.join(stage.file_name().context("stage has no filename")?);
+            let dest_parent =
+                fs::canonicalize(destination.parent().context("destination has no parent")?)?;
+            let dest_name = dest_parent.join(
+                destination
+                    .file_name()
+                    .context("destination has no filename")?,
+            );
+            let from = stage_name
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let to = dest_name
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            if from[..from.len() - 1].contains(&0) || to[..to.len() - 1].contains(&0) {
+                bail!("Windows publish path contains an interior NUL");
+            }
+            // Zero flags deliberately excludes both MOVEFILE_REPLACE_EXISTING
+            // and MOVEFILE_COPY_ALLOWED. Stage and target share a parent,
+            // so this is a same-volume no-replace move, not a copy+delete.
+            let rc = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
+            if rc == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("exclusive publish {}", destination.display()));
+            }
+            return Ok(None);
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            fs::hard_link(stage, destination).with_context(|| {
+                format!(
+                    "destination appeared or filesystem does not support safe no-replace publish: {}",
+                    destination.display()
+                )
+            })?;
+            fs::remove_file(stage)
+                .with_context(|| format!("remove published temporary name {}", stage.display()))?;
+            return Ok(None);
+        }
     }
-    atomic_replace(stage, destination)
+    atomic_replace(stage, destination)?;
+    Ok(None)
 }
 
 pub(crate) fn atomic_replace(stage: &Path, destination: &Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        if fs::symlink_metadata(destination).is_ok() {
-            let backup = new_temp_path(destination)?;
-            fs::rename(destination, &backup.0)?;
-            if let Err(publish_error) = fs::rename(stage, destination) {
-                if let Err(restore_error) = fs::rename(&backup.0, destination) {
-                    // Never delete the only surviving copy of the old destination.
-                    // Leave the backup on disk for manual recovery and report its location.
-                    let recovery_path = backup.0.clone();
-                    std::mem::forget(backup);
-                    bail!(
-                        "failed to publish {}: {}; could not restore previous destination: {};                          ORIGINAL DATA RETAINED AT {} (manual recovery required)",
-                        destination.display(),
-                        publish_error,
-                        restore_error,
-                        recovery_path.display()
-                    );
-                }
-                return Err(publish_error.into());
-            }
-            return Ok(());
-        }
-    }
+    // Both names share a directory. Let the OS replace the destination in one rename.
     fs::rename(stage, destination)
         .with_context(|| format!("publish {} -> {}", stage.display(), destination.display()))
 }
@@ -562,12 +1033,13 @@ fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Resu
     ensure_directory(parent)?;
     check_destination_file(&task.source, &task.destination, cli.overwrite)?;
 
-    let temporary = new_temp_path(&task.destination)?;
-    let (staged_handle, original_permissions) = match task.kind {
+    let temporary_path = new_temp_path(&task.destination)?;
+    let (temporary, staged_handle, original_permissions) = match task.kind {
         Kind::Regular => {
             // Exclusive creation keeps stale names non-destructive; all writes
             // use the same open file descriptor (never reopen by path).
-            let mut staged = reserve_private_stage(&temporary.0)?;
+            let mut staged = reserve_private_stage(&temporary_path)?;
+            let temporary = TempPath(temporary_path);
             let mut source = fs::File::open(&task.source)
                 .with_context(|| format!("open source {}", task.source.display()))?;
             let original_permissions = source.metadata()?.permissions();
@@ -614,18 +1086,19 @@ fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Resu
                     );
                 }
             }
-            (Some(staged), Some(original_permissions))
+            (temporary, Some(staged), Some(original_permissions))
         }
         Kind::Symlink => {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::symlink;
                 let link = fs::read_link(&task.source)?;
-                symlink(&link, &temporary.0)?;
+                symlink(&link, &temporary_path)?;
+                let temporary = TempPath(temporary_path);
                 if !cli.no_hash && fs::read_link(&temporary.0)? != link {
                     bail!("symlink verification FAILED: {}", task.source.display());
                 }
-                (None, None)
+                (temporary, None, None)
             }
             #[cfg(not(unix))]
             bail!("symlink copies are unsupported on this platform");
@@ -661,17 +1134,30 @@ fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Resu
 
     // Recheck before committing: the target might have changed during a long copy.
     check_destination_file(&task.source, &task.destination, cli.overwrite)?;
-    publish_stage(&temporary.0, &task.destination, cli.overwrite)?;
-    // Do not relax 0600 while staging. Apply original permissions through
-    // the still-open inode only after it has been safely published.
-    if let (Some(staged), Some(permissions)) = (&staged_handle, original_permissions) {
+    let exclusive_output = publish_stage_options(
+        &temporary.0,
+        &task.destination,
+        may_replace(task.overwrite_target.as_ref(), &task.destination)?,
+        cli.allow_nonatomic_publish,
+        staged_handle.as_ref(),
+    )?;
+    // On the non-atomic macOS fallback, the stage and published inode differ.
+    // Restore times on the *pinned* output, not the now-removed staged name.
+    if let Some(output) = &exclusive_output
+        && let Some((atime, mtime)) = task.source_times
+    {
+        filetime::set_file_handle_times(output, Some(atime), Some(mtime))?;
+    }
+    let published_handle = exclusive_output.as_ref().or(staged_handle.as_ref());
+    // Restore original permissions only through the published inode.
+    if let (Some(staged), Some(permissions)) = (published_handle, original_permissions) {
         staged.set_permissions(permissions).with_context(|| {
             format!(
                 "apply published file permissions {}",
                 task.destination.display()
             )
         })?;
-        if cli.move_mode || cli.overwrite {
+        if cli.move_mode || cli.overwrite || exclusive_output.is_some() {
             staged.sync_all().with_context(|| {
                 format!(
                     "sync published file metadata {}",
@@ -712,6 +1198,114 @@ fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Resu
     Ok(())
 }
 
+// A verified copy is not enough for MOVE: a later --overwrite could have
+// replaced an earlier planned destination on a case-insensitive filesystem.
+// Re-hash *all* final names, even under --no-hash, before deleting any source.
+fn verify_move_destinations(plan: &Plan) -> Result<()> {
+    #[cfg(unix)]
+    let mut file_ids = HashSet::<(u64, u64)>::new();
+    #[cfg(windows)]
+    let mut windows_file_ids = HashSet::<WindowsFileIdentity>::new();
+    for dir in &plan.directories {
+        let metadata = fs::symlink_metadata(&dir.destination).with_context(|| {
+            format!(
+                "move destination directory missing: {}",
+                dir.destination.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            bail!(
+                "move destination is no longer a directory: {}",
+                dir.destination.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if !file_ids.insert((metadata.dev(), metadata.ino())) {
+                bail!("two planned move directories resolve to one destination; sources retained");
+            }
+        }
+        #[cfg(windows)]
+        if !windows_file_ids.insert(windows_file_identity(&dir.destination)?) {
+            bail!(
+                "two planned Windows move directories resolve to one destination; sources retained"
+            );
+        }
+    }
+    for task in &plan.files {
+        let target_meta = fs::symlink_metadata(&task.destination)
+            .with_context(|| format!("move destination missing: {}", task.destination.display()))?;
+        let source_meta = fs::symlink_metadata(&task.source)
+            .with_context(|| format!("move source missing: {}", task.source.display()))?;
+        ensure_move_kind(
+            &task.source,
+            &source_meta,
+            &task.destination,
+            &target_meta,
+            task.kind,
+        )?;
+        match task.kind {
+            Kind::Regular => {
+                if source_meta.len() != target_meta.len()
+                    || hash_file(&task.source, crate::HashAlg::Blake3)?
+                        != hash_file(&task.destination, crate::HashAlg::Blake3)?
+                {
+                    bail!(
+                        "move target content mismatch; sources retained: {}",
+                        task.destination.display()
+                    );
+                }
+            }
+            Kind::Symlink =>
+            {
+                #[cfg(unix)]
+                if fs::read_link(&task.source)? != fs::read_link(&task.destination)? {
+                    bail!(
+                        "move target symlink mismatch; sources retained: {}",
+                        task.destination.display()
+                    );
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if !file_ids.insert((target_meta.dev(), target_meta.ino())) {
+                bail!("two planned move destinations resolve to the same inode; sources retained");
+            }
+        }
+        #[cfg(windows)]
+        if !windows_file_ids.insert(windows_file_identity(&task.destination)?) {
+            bail!("two planned Windows move destinations resolve to one file ID; sources retained");
+        }
+    }
+    Ok(())
+}
+
+fn ensure_move_kind(
+    source: &Path,
+    source_meta: &fs::Metadata,
+    destination: &Path,
+    target_meta: &fs::Metadata,
+    kind: Kind,
+) -> Result<()> {
+    let matches = match kind {
+        Kind::Regular => source_meta.is_file() && target_meta.is_file(),
+        Kind::Symlink => {
+            source_meta.file_type().is_symlink() && target_meta.file_type().is_symlink()
+        }
+    };
+    if !matches {
+        bail!(
+            "move source/destination type changed; sources retained: {} -> {}",
+            source.display(),
+            destination.display()
+        );
+    }
+    Ok(())
+}
+
 // A move is a two-phase operation: publish verified files, then remove ONLY
 // the sources that were explicitly recorded in the plan. Never recursively
 // delete the source tree: another application may have written new content.
@@ -744,6 +1338,13 @@ fn check_move_source_snapshot(plan: &Plan) -> Result<()> {
                 );
             }
         }
+        #[cfg(windows)]
+        if file.move_windows_identity != Some(windows_file_identity(&file.source)?) {
+            bail!(
+                "move source Windows file ID changed; refusing deletion: {}",
+                file.source.display()
+            );
+        }
     }
     for dir in &plan.directories {
         planned.insert(dir.source.clone());
@@ -769,13 +1370,12 @@ fn check_move_source_snapshot(plan: &Plan) -> Result<()> {
         }
         #[cfg(windows)]
         {
-            // File-index / volume ID from std::MetadataExt are unstable on
-            // stable Rust. Creation-time + modification-time are the strongest
-            // portable standard-library check we can apply on Windows here.
             use std::os::windows::fs::MetadataExt;
-            if current.creation_time() != original.creation_time() {
+            if current.creation_time() != original.creation_time()
+                || dir.move_windows_identity != Some(windows_file_identity(&dir.source)?)
+            {
                 bail!(
-                    "move source directory was replaced: {}",
+                    "move source directory Windows file ID changed; refusing deletion: {}",
                     dir.source.display()
                 );
             }
@@ -885,6 +1485,7 @@ pub(crate) fn execute(cli: &Cli, plan: &Plan) -> Result<()> {
             &plan.files[0].source,
             &plan.files[0].destination,
             plan.files[0].source_times,
+            plan.files[0].overwrite_target.as_ref(),
         );
     }
     if cli.dry_run {
@@ -990,6 +1591,7 @@ pub(crate) fn execute(cli: &Cli, plan: &Plan) -> Result<()> {
         // Fail closed if the input tree gained ANY unplanned entry after
         // enumeration. Another process may be actively writing to it.
         check_move_source_snapshot(plan)?;
+        verify_move_destinations(plan)?;
         #[cfg(unix)]
         sync_move_destinations(&move_sync_directories)?;
         // Remove only planned files and links. Never use remove_dir_all.
@@ -1031,6 +1633,103 @@ mod move_safety_tests {
     use super::*;
     use clap::Parser;
 
+    #[cfg(unix)]
+    #[test]
+    fn new_destination_ancestors_remain_private_even_before_final_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("data/private/inner");
+        ensure_directory(&nested).unwrap();
+        for dir in [
+            tmp.path().join("data"),
+            tmp.path().join("data/private"),
+            nested,
+        ] {
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "new destination ancestor must not expose private source contents: {}",
+                dir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn move_requires_each_empty_destination_directory_before_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("source");
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&dest).unwrap();
+        let cli = Cli::parse_from([
+            "mch",
+            "--move",
+            src.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ]);
+        let plan = build_plan(&cli, &dest).unwrap();
+        let target = &plan.directories[0].destination;
+        assert!(verify_move_destinations(&plan).is_err());
+        fs::write(target, b"wrong type").unwrap();
+        assert!(verify_move_destinations(&plan).is_err());
+        fs::remove_file(target).unwrap();
+        fs::create_dir(target).unwrap();
+        assert!(verify_move_destinations(&plan).is_ok());
+        assert!(src.is_dir());
+    }
+
+    #[test]
+    fn move_target_recheck_catches_replaced_destination_even_same_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("source");
+        let dest = tmp.path().join("dest");
+        fs::write(&src, b"AAA").unwrap();
+        fs::write(&dest, b"AAA").unwrap();
+        let cli = Cli::parse_from([
+            "mch",
+            "--move",
+            "--overwrite",
+            src.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ]);
+        let plan = build_plan(&cli, &dest).unwrap();
+        fs::write(&dest, b"BBB").unwrap();
+        assert!(verify_move_destinations(&plan).is_err());
+        assert_eq!(fs::read(&src).unwrap(), b"AAA");
+    }
+
+    #[test]
+    fn overwrite_only_replaces_the_planned_destination() {
+        for resume in [false, true] {
+            if resume && !cfg!(unix) {
+                continue;
+            }
+            for existed in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let src = tmp.path().join("source");
+                let dst = tmp.path().join("destination");
+                fs::write(&src, b"copy").unwrap();
+                if existed {
+                    fs::write(&dst, b"old").unwrap();
+                }
+                let mut args = vec!["mch", "--move", "--overwrite"];
+                if resume {
+                    args.push("--resume");
+                }
+                args.extend([src.to_str().unwrap(), dst.to_str().unwrap()]);
+                let cli = Cli::parse_from(args);
+                let plan = build_plan(&cli, &dst).unwrap();
+                if existed {
+                    fs::rename(&dst, tmp.path().join("retired")).unwrap();
+                }
+                fs::write(&dst, b"new").unwrap();
+                assert!(execute(&cli, &plan).is_err());
+                assert_eq!(fs::read(&src).unwrap(), b"copy");
+                assert_eq!(fs::read(&dst).unwrap(), b"new");
+            }
+        }
+    }
+
     #[test]
     fn publication_without_overwrite_refuses_a_new_target() {
         let t = tempfile::tempdir().unwrap();
@@ -1041,6 +1740,98 @@ mod move_safety_tests {
         assert!(publish_stage(&stage, &destination, false).is_err());
         assert_eq!(fs::read(&destination).unwrap(), b"precious other data");
         assert_eq!(fs::read(&stage).unwrap(), b"new copy");
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn native_exclusive_publish_consumes_stage_without_hardlink_fallback() {
+        let t = tempfile::tempdir().unwrap();
+        let stage = t.path().join("staged");
+        let destination = t.path().join("new-target");
+        fs::write(&stage, b"verified copy").unwrap();
+        publish_stage(&stage, &destination, false).unwrap();
+        assert!(
+            !stage.exists(),
+            "native rename should consume the staging name"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"verified copy");
+        assert!(publish_stage(&stage, &destination, false).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"verified copy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_nonatomic_copy_verifies_bytes_and_does_not_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        let target = dir.path().join("target");
+        let mut pinned = reserve_private_stage(&stage).unwrap();
+        let expected = vec![0xAD_u8; 2 * 1024 * 1024 + 117];
+        pinned.write_all(&expected).unwrap();
+        pinned.sync_all().unwrap();
+        let published = exclusive_nonatomic_copy(&pinned, &stage, &target).unwrap();
+        assert_eq!(published.metadata().unwrap().len(), expected.len() as u64);
+        assert!(!stage.exists());
+        assert_eq!(fs::read(&target).unwrap(), expected);
+
+        let second_stage = dir.path().join("second_stage");
+        let mut new = reserve_private_stage(&second_stage).unwrap();
+        new.write_all(b"other content").unwrap();
+        assert!(exclusive_nonatomic_copy(&new, &second_stage, &target).is_err());
+        assert_eq!(fs::read(&target).unwrap(), expected);
+        assert_eq!(fs::read(&second_stage).unwrap(), b"other content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_nonatomic_copy_refuses_symlink_and_preserves_target() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        let target = dir.path().join("target");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"valuable").unwrap();
+        let mut pinned = reserve_private_stage(&stage).unwrap();
+        pinned.write_all(b"untrusted").unwrap();
+        symlink(&victim, &target).unwrap();
+        assert!(exclusive_nonatomic_copy(&pinned, &stage, &target).is_err());
+        assert_eq!(fs::read(victim).unwrap(), b"valuable");
+        assert!(
+            fs::symlink_metadata(target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(stage).unwrap(), b"untrusted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_nonatomic_copy_concurrent_writers_have_one_winner() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let barrier = Arc::new(Barrier::new(6));
+        let mut threads = Vec::new();
+        for id in 0..6_u8 {
+            let stage = dir.path().join(format!("stage-{id}"));
+            let mut fd = reserve_private_stage(&stage).unwrap();
+            fd.write_all(&vec![id; 16_384]).unwrap();
+            let dest = target.clone();
+            let shared = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                shared.wait();
+                exclusive_nonatomic_copy(&fd, &stage, &dest).is_ok()
+            }));
+        }
+        let results = threads
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|&&succeeded| succeeded).count(), 1);
+        let content = fs::read(target).unwrap();
+        assert_eq!(content.len(), 16_384);
+        assert!(content.iter().all(|byte| *byte == content[0]));
     }
 
     #[cfg(unix)]
@@ -1150,6 +1941,24 @@ mod move_safety_tests {
             !dest
                 .join("ongoing-download/nested/just-created.txt")
                 .exists()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_detects_replaced_directory_with_identical_timestamp() {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("source");
+        let renamed = t.path().join("renamed");
+        fs::create_dir(&source).unwrap();
+        let before = windows_file_identity(&source).unwrap();
+        fs::rename(&source, &renamed).unwrap();
+        assert_eq!(before, windows_file_identity(&renamed).unwrap());
+        fs::create_dir(&source).unwrap();
+        let after = windows_file_identity(&source).unwrap();
+        assert_ne!(
+            before, after,
+            "replacement must have a different Windows file ID"
         );
     }
 

@@ -1,13 +1,16 @@
-# MCH Release Integrity Policy (from v0.2.3)
+# MCH release integrity from v0.2.3
 
-- Repository setting **Enable release immutability** must be enabled **before** any release is published (verified 2026-10-22 through GitHub's `/immutable-releases` API).
-- Release pipeline starts only on a new stable `vX.Y.Z` tag pushed from an ancestor of public `main`. Manual reruns targeting already published releases are deliberately unsupported.
-- `verify` rejects pre-existing published releases, tags older than v0.2.3, malformed versions, tags not on `main`, and tags disagreeing with the package version.
-- Five platform binaries and the two source archives are built with the exact Rust toolchain version **1.99.1** and pinned GitHub Actions versions. Android output is cross-compiled with Bionic and its dynamic linker explicitly inspected.
-- A **draft** release is created only after every build job and archive validation passed. Seven archives and a SHA256SUMS are uploaded **without overwriting** prior assets.
-- Exactly eight remote asset digests are rechecked before the draft is made public. GitHub's `immutable` property must be true after publication.
-- Incomplete or failed draft builds are deliberately not automatically published. Manual inspection and a **new tag / patch release** are safer than overwriting immutable downloads.
-- Old v0.2.2 and earlier artifacts remain mutable: repository immutability changes apply to future releases only. Never use this new workflow to re-upload their assets.
-- Releasing code still requires explicit review, independent CI and actual target-platform testing; workflow safeguards do not substitute for review.
+Run Linux x86-64 tests, Linux AArch64 tests under QEMU, Android API 24 builds, policy checks and assembly on SRV. Run native Windows x64 MSVC tests and exFAT checks in the Win11 VM on SRV. GitHub Actions runs the ARM64 macOS tests and creates the tested macOS binary. Public pull requests do not dispatch code to SRV.
 
-Do not create a published release manually before the tag-triggered pipeline completes: GitHub will immediately seal an immutable empty release, preventing attachments.
+Before merging a public release PR, run the checks on its exact public revision. Use the trusted SRV operator checkout to verify the complete Linux, cross-build and Windows transcripts and report the results for that revision. Keep the required public PR review and the three required contexts. The two historical context names containing ubuntu-latest and windows-latest continue to identify checks in branch protection. Their work runs on SRV and the Win11 VM. If GitHub pins their app identity, have the maintainer bind those two contexts to the trusted status producer as part of migration. Keep the macOS context bound to Actions.
+
+For a stable version, the three local transcripts, binary hashes and the hosted macOS artifact must identify the public commit at the stable tag. The private integration run alone qualifies only for a rehearsal. Native Termux device execution, when required by the release review, is recorded separately from the SRV Android cross-build.
+
+## Operator sequence
+
+1. Review and approve the exact product changes. Merge by public pull request. Obtain separate release authorization before pushing a stable tag. Use only a new stable tag at the approved public commit with matching Cargo version. Enable immutable releases before publishing.
+2. Test the public source. Run scripts/run-srv-ci.sh for Linux and scripts/run-srv-cross.sh for AArch64 and Android. Transfer the exact Git tar archive to the Win11 VM and run scripts/run-windows-ci.ps1 with the full commit, archive, a new workspace and disposable exFAT drive. Run scripts/check-release-policy.py on SRV with Python 3.11+ and PyYAML. Use isolated build output and retain all transcripts.
+3. Retrieve the successful tag workflow's macOS artifact. Match its commit, executable version, archive digest and workflow identity. Preserve the tested Linux, Android and Windows binaries when their jobs finish. Place the five tested executables in an operator-owned inputs directory, each under its platform name. Write binaries.json with the producer commit and each executable's independently recorded commit, version and SHA-256.
+4. Run scripts/package-on-srv.py with --public (public checkout), --built (producer checkout), --inputs and --output (new directory). For a stable version, the producer SHA must equal the public tag SHA. A private rehearsal is possible only with an RC version and --rehearsal. Source ZIP and tar.gz always come from the public Git tree.
+5. Use scripts/publish-from-srv.py with --public, --dist and --inputs to revalidate all five packaged executables, documentation, source archives and checksums. Add --rehearsal for an RC. Without --publish the command only reads local files and Git. For an authorized stable publication, supply a least-privilege release token via MCH_RELEASE_TOKEN, use --publish and perform the interactive confirmation. The operator on SRV uploads only after checking the tag and repository immutability.
+6. The operator script refuses historical releases, an existing published release or a populated draft. It uploads seven archives plus SHA256SUMS.txt into an empty draft, checks all remote asset digests and the tag again, and checks the immutable published release. After an interrupted upload, inspect the private draft before deciding how to proceed. Existing published assets must never be replaced.
