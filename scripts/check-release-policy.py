@@ -1,29 +1,38 @@
 #!/usr/bin/env python3
-"""Fail-closed source policy for the public release workflow."""
+"""Check hosted runner routing and release safety on SRV."""
 from pathlib import Path
 import re
+import subprocess
+import sys
+import yaml
 
 root = Path(__file__).resolve().parents[1]
-workflow = (root / ".github/workflows/release-packages.yml").read_text()
-def check(cond, message):
-    if not cond:
-        raise SystemExit("RELEASE POLICY BLOCK: " + message)
+workflows = root / ".github/workflows"
+def require(ok, reason):
+    if not ok:
+        raise SystemExit("RELEASE POLICY BLOCK: " + reason)
 
-check("  push:\n    tags:" in workflow, "tag push must start release build")
-check("  workflow_dispatch:" not in workflow, "manual rebuild trigger forbidden")
-check("types: [published]" not in workflow, "published-release trigger too late")
-check(bool(re.search(r'^\s+toolchain:\s*"?\d+\.\d+\.\d+"?\s*$', workflow, re.M)), "pin exact Rust version")
-check("gh release create \"$TAG\"" in workflow and "--draft" in workflow, "draft before publish")
-check("gh release upload \"$TAG\" dist/*" in workflow, "expected upload")
-check(not re.search(r'^\s*gh release upload[^\n]*--clobber', workflow, re.M), "no clobber")
-check('gh release edit "$TAG"' in workflow and "--draft=false" in workflow, "publish verified draft")
-check('uploaded[name].get("digest")' in workflow, "verify remote SHA256 digests")
-check('"isDraft,assets"' in workflow and '["gh", "release", "view"' in workflow,
-      "draft-aware asset inspection; REST by-tag omits drafts")
-check("Remote tag moved after validation" in workflow and "Remote tag changed before publication" in workflow,
-      "compare peeled remote tag with pinned verified commit before draft and publish")
-check('".immutable"' in workflow or ".immutable)" in workflow or "--jq .immutable" in workflow, "check immutable")
-check("Already published; refusing replacement" in workflow, "refuse published tag")
-check("Historical tag: refuse rebuild" in workflow, "no historical rebuilds")
-check("Expected eight immutable release assets" in workflow, "final asset count")
+
+def check_workflow(path):
+    data = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+    require(data["permissions"] == {"contents": "read"}, "workflows must have read-only contents")
+    require(len(data["jobs"]) == 1, "expected exactly one macOS job per workflow")
+    job, = data["jobs"].values()
+    require(job.get("runs-on") == "macos-15" and "strategy" not in job and "permissions" not in job,
+            "expected a single Apple Silicon runner with inherited permissions")
+    for step in job["steps"]:
+        if "uses" in step:
+            require(re.fullmatch(r"[\w.-]+/[\w.-]+@[a-f0-9]{40}", step["uses"]), "pin each external action by SHA")
+    if path.name == "release-packages.yml":
+        require(data["on"] == {"push": {"tags": ["v[0-9]*"]}}, "stable tag trigger required")
+        require(any(s.get("uses", "").startswith("actions/upload-artifact@") for s in job["steps"]), "missing macOS artifact")
+        require(any(s.get("with", {}).get("toolchain") == "1.100.0" for s in job["steps"]), "versioned release toolchain required")
+    else:
+        require(set(data["on"]) == {"push", "pull_request"}, "public CI triggers differ")
+
+
+require({p.name for p in workflows.iterdir()} == {"ci.yml","release-packages.yml"}, "unexpected public workflow")
+for path in sorted(workflows.iterdir()):
+    check_workflow(path)
+subprocess.run([sys.executable, "-B", str(root / "scripts/test-release-publication.py")], check=True)
 print("PUBLIC_RELEASE_POLICY_PASS")
