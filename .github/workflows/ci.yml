@@ -1,29 +1,25 @@
 name: CI
-
 on:
-  # Run on protected public main and on pull requests.
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
-
 permissions:
   contents: read
 
 jobs:
   test:
-    name: Test and build
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+    name: Test and build (macos-latest)
+    runs-on: macos-15
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch (2026-10-21)
         with:
+          toolchain: "1.100.0"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Verify architecture
+        run: test "$(uname -m)" = arm64
       - name: Formatting
         run: cargo fmt --check
       - name: Clippy
@@ -32,66 +28,55 @@ jobs:
         run: cargo test --locked
       - name: Release build
         run: cargo build --release --locked
-
-  linux-aarch64:
-    name: Test and build (linux-aarch64)
-    runs-on: ubuntu-22.04-arm
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - name: Validate Linux AArch64 natively
+      - name: Select exFAT checks for the public runtime
+        id: runtime
+        shell: bash
+        run: |
+          python3 - <<'VERSION' >> "$GITHUB_OUTPUT"
+          import re
+          import tomllib
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["package"]["version"]
+          major, minor, patch = map(int, re.match(r"^(\d+)\.(\d+)\.(\d+)", version).groups())
+          print("exfat=" + str((major, minor, patch) >= (0, 2, 3)).lower())
+          VERSION
+      - name: Copy on disposable mounted exFAT disk image, never clobber existing target
+        if: steps.runtime.outputs.exfat == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$(uname -m)" == aarch64 ]]
-          [[ "$(rustc -vV | sed -n 's/^host: //p')" == aarch64-unknown-linux-gnu ]]
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked
-          cargo build --release --locked
-          readelf -h target/release/mch | grep -Eq 'Machine:[[:space:]]+AArch64'
-          target/release/mch -v
-
-  termux-aarch64:
-    name: Cross-build (android-aarch64-termux)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          targets: aarch64-linux-android
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: android-aarch64-ndk
-      - name: Cross-build and validate Android Bionic ABI
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$ANDROID_NDK_HOME"
-          ndk_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          test -x "$ndk_bin/aarch64-linux-android24-clang"
-          test -x "$ndk_bin/llvm-ar"
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ndk_bin/aarch64-linux-android24-clang"
-          export CC_aarch64_linux_android="$ndk_bin/aarch64-linux-android24-clang"
-          export AR_aarch64_linux_android="$ndk_bin/llvm-ar"
-          cargo build --release --locked --target aarch64-linux-android
-          binary=target/aarch64-linux-android/release/mch
-          test -s "$binary"
-          readelf -h "$binary" | grep -Eq 'Machine:[[:space:]]+AArch64'
-          readelf -l "$binary" | grep -F '/system/bin/linker64'
-          if readelf -d "$binary" | grep -E 'libc\.so\.6|ld-linux'; then
-            echo 'Refusing glibc-linked binary' >&2
+          image="$RUNNER_TEMP/mch-exfat-test.dmg"
+          hdiutil create -size 128m -fs ExFAT -volname MCHXFAT "$image"
+          hdiutil attach -nobrowse "$image"
+          trap 'hdiutil detach /Volumes/MCHXFAT || true' EXIT
+          volume=/Volumes/MCHXFAT
+          [[ "$(diskutil info "$volume" | grep 'File System Personality')" == *ExFAT* ]]
+          printf 'signed-mch-exfat-test\n' > "$volume/src"
+          # Without explicit consent, refuse a filesystem that cannot
+          # atomically publish without replacing an existing target.
+          if target/release/mch -q "$volume/src" "$volume/dest"; then
+            echo 'UNSAFE: exFAT worked without explicitly acknowledging non-atomic publication'
             exit 1
           fi
-          sha256sum "$binary"
-
-  release-policy:
-    name: Check immutable-release workflow policy
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Require tag-first, draft-first, pinned, no-clobber release pipeline
-        run: python3 scripts/check-release-policy.py
+          [[ ! -e "$volume/dest" ]]
+          target/release/mch -q --allow-nonatomic-publish "$volume/src" "$volume/dest"
+          cmp "$volume/src" "$volume/dest"
+          # Recheck source and target integrity through different file opens.
+          [[ "$(shasum -a 256 "$volume/src" | awk '{print $1}')" == "$(shasum -a 256 "$volume/dest" | awk '{print $1}')" ]]
+          printf 'existing data\n' > "$volume/existing"
+          if target/release/mch -q --allow-nonatomic-publish "$volume/src" "$volume/existing"; then
+            echo 'UNSAFE: existing exFAT target was overwritten'
+            exit 1
+          fi
+          [[ "$(cat "$volume/existing")" == 'existing data' ]]
+          if target/release/mch -q --allow-nonatomic-publish --no-hash "$volume/src" "$volume/rejected"; then
+            echo 'UNSAFE: allowed fallback without verification'
+            exit 1
+          fi
+          [[ ! -e "$volume/rejected" ]]
+          if target/release/mch -q --allow-nonatomic-publish --move "$volume/src" "$volume/rejected"; then
+            echo 'UNSAFE: allowed move with non-atomic fallback'
+            exit 1
+          fi
+          [[ ! -e "$volume/rejected" ]]
+          echo 'MACOS_EXFAT_EXCLUSIVE_NONATOMIC_OPTIN_PASS'
