@@ -81,6 +81,11 @@ struct Cli {
     #[arg(long = "overwrite")]
     overwrite: bool,
 
+    /// macOS only: explicitly permit non-atomic verified copy on unsupported filesystems.
+    /// A crash can leave a partial destination; never replaces an existing target.
+    #[arg(long = "allow-nonatomic-publish")]
+    allow_nonatomic_publish: bool,
+
     /// Display planned operations without writing or deleting anything
     #[arg(long = "dry-run")]
     dry_run: bool,
@@ -172,6 +177,16 @@ fn run() -> Result<()> {
     }
     if cli.only_src_content && cli.sources.len() != 1 {
         anyhow::bail!("-O/--only-src-content requires exactly one source directory");
+    }
+    #[cfg(not(target_os = "macos"))]
+    if cli.allow_nonatomic_publish {
+        anyhow::bail!("--allow-nonatomic-publish is supported only on macOS");
+    }
+    if cli.allow_nonatomic_publish && (cli.move_mode || cli.overwrite || cli.no_hash || cli.resume)
+    {
+        anyhow::bail!(
+            "--allow-nonatomic-publish requires verified ordinary copy (no --move, --overwrite, --no-hash, or --resume)"
+        );
     }
     if cli.resume {
         if cli.no_hash {

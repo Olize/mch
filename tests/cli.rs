@@ -35,6 +35,73 @@ fn assert_error(output: Output) {
     );
 }
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn non_atomic_fallback_is_mac_only_and_does_not_create_a_target() {
+    let t = TempDir::new().unwrap();
+    let source = t.path().join("source");
+    let destination = t.path().join("target");
+    write(&source, "source must remain unchanged");
+    let error = mch(&[
+        "--allow-nonatomic-publish",
+        source.to_str().unwrap(),
+        destination.to_str().unwrap(),
+    ]);
+    assert_error(error.clone());
+    assert!(String::from_utf8_lossy(&error.stderr).contains("supported only on macOS"));
+    assert!(!destination.exists());
+    assert_eq!(
+        fs::read_to_string(source).unwrap(),
+        "source must remain unchanged"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_nonatomic_opt_in_remains_safe_on_native_atomic_filesystems() {
+    let t = TempDir::new().unwrap();
+    let source = t.path().join("source");
+    let destination = t.path().join("target");
+    write(&source, "macos native safe publish");
+    assert_success(mch(&[
+        "--allow-nonatomic-publish",
+        source.to_str().unwrap(),
+        destination.to_str().unwrap(),
+    ]));
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "macos native safe publish"
+    );
+    assert_error(mch(&[
+        "--allow-nonatomic-publish",
+        source.to_str().unwrap(),
+        destination.to_str().unwrap(),
+    ]));
+    assert_eq!(
+        fs::read_to_string(destination).unwrap(),
+        "macos native safe publish"
+    );
+}
+
+#[test]
+fn nonatomic_flag_refuses_move_overwrite_and_unverified_copies() {
+    let t = TempDir::new().unwrap();
+    let source = t.path().join("source");
+    let destination = t.path().join("target");
+    write(&source, "never delete or overwrite");
+    for flag in ["--move", "--overwrite", "--no-hash", "--resume"] {
+        let error = mch(&[
+            "--allow-nonatomic-publish",
+            flag,
+            source.to_str().unwrap(),
+            destination.to_str().unwrap(),
+        ]);
+        assert_error(error);
+        assert!(source.exists());
+        assert!(!destination.exists());
+    }
+}
+
 #[test]
 fn help_and_version_require_no_paths() {
     assert_success(mch(&["--help"]));
@@ -51,6 +118,199 @@ fn help_and_version_require_no_paths() {
     assert_error(result.clone());
     assert!(String::from_utf8_lossy(&result.stderr).contains("no files were copied"));
     assert!(src.exists() && !dst.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn copy_preserves_distinct_non_utf8_names_and_the_replacement_character() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let t = TempDir::new().unwrap();
+    let src = t.path().join("src");
+    let dst = t.path().join("dst");
+    fs::create_dir(&src).unwrap();
+    let names: [&[u8]; 3] = [b"log-\x80", b"log-\x81", "log-\u{fffd}".as_bytes()];
+    for name in names {
+        fs::write(src.join(OsStr::from_bytes(name)), name).unwrap();
+    }
+    assert_success(mch(&[src.to_str().unwrap(), dst.to_str().unwrap()]));
+    for name in names {
+        assert_eq!(
+            fs::read(dst.join("src").join(OsStr::from_bytes(name))).unwrap(),
+            name
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn invalid_bytes_in_parent_preserve_unicode_collision_checks_for_children() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let t = TempDir::new().unwrap();
+    let src = t.path().join("src");
+    let parent = src.join(OsStr::from_bytes(b"raw-\x80"));
+    let dst = t.path().join("dst");
+    fs::create_dir_all(&parent).unwrap();
+    write(&parent.join("CAF\u{c9}"), "upper");
+    write(&parent.join("cafe\u{301}"), "lower");
+    let result = mch(&[src.to_str().unwrap(), dst.to_str().unwrap()]);
+    assert_error(result.clone());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("destination collision"));
+    assert!(!dst.exists());
+}
+
+#[test]
+fn move_overwrite_rejects_casefold_colliding_targets_without_deleting_sources() {
+    let t = TempDir::new().unwrap();
+    let src1 = t.path().join("one");
+    let src2 = t.path().join("two");
+    let dst = t.path().join("destination");
+    fs::create_dir_all(&src1).unwrap();
+    fs::create_dir_all(&src2).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    let a = src1.join("Report.txt");
+    let b = src2.join("report.txt");
+    write(&a, "A original source");
+    write(&b, "B other source");
+    let result = mch(&[
+        "--move",
+        "--overwrite",
+        "--count",
+        "4",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]);
+    assert_error(result.clone());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("case-insensitive destination collision")
+    );
+    assert_eq!(fs::read_to_string(&a).unwrap(), "A original source");
+    assert_eq!(fs::read_to_string(&b).unwrap(), "B other source");
+    assert_eq!(fs::read_dir(dst).unwrap().count(), 0);
+}
+
+#[test]
+fn move_overwrite_rejects_unicode_nfc_nfd_aliases_before_writing() {
+    let t = TempDir::new().unwrap();
+    let src1 = t.path().join("one");
+    let src2 = t.path().join("two");
+    let dst = t.path().join("destination");
+    fs::create_dir_all(&src1).unwrap();
+    fs::create_dir_all(&src2).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+
+    // Canonically equivalent Unicode filenames must never alias on a
+    // normalization-insensitive target after overwriting the first result.
+    let a = src1.join("Caf\u{e9}.txt");
+    let b = src2.join("Cafe\u{301}.txt");
+    write(&a, "first independent source");
+    write(&b, "second independent source");
+    let result = mch(&[
+        "--move",
+        "--overwrite",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]);
+    assert_error(result.clone());
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("Unicode-normalized destination collision")
+    );
+    assert_eq!(fs::read_to_string(&a).unwrap(), "first independent source");
+    assert_eq!(fs::read_to_string(&b).unwrap(), "second independent source");
+    assert_eq!(fs::read_dir(dst).unwrap().count(), 0);
+}
+
+#[test]
+fn move_overwrite_rejects_combined_unicode_case_and_normalization_aliases() {
+    let t = TempDir::new().unwrap();
+    let src1 = t.path().join("one");
+    let src2 = t.path().join("two");
+    let dst = t.path().join("destination");
+    fs::create_dir_all(&src1).unwrap();
+    fs::create_dir_all(&src2).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+
+    let a = src1.join("R\u{c9}SUM\u{c9}.txt");
+    let b = src2.join("re\u{301}sume\u{301}.txt");
+    write(&a, "first independent source");
+    write(&b, "second independent source");
+    let result = mch(&[
+        "--move",
+        "--overwrite",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]);
+    assert_error(result);
+    assert!(a.exists() && b.exists());
+    assert_eq!(fs::read_dir(dst).unwrap().count(), 0);
+}
+
+// Most macOS/Windows filesystems cannot create both differently-cased
+// source directories for this fixture. Two distinct root sources above
+// provide a portable cross-platform collision regression.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn move_overwrite_rejects_casefold_colliding_subdirectories() {
+    let t = TempDir::new().unwrap();
+    let src = t.path().join("src");
+    let dst = t.path().join("dst");
+    fs::create_dir_all(src.join("docs")).unwrap();
+    fs::create_dir_all(src.join("DOCS")).unwrap();
+    write(&src.join("docs/readme"), "first");
+    write(&src.join("DOCS/readme"), "second");
+    let result = mch(&[
+        "--move",
+        "--overwrite",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]);
+    assert_error(result);
+    assert_eq!(
+        fs::read_to_string(src.join("docs/readme")).unwrap(),
+        "first"
+    );
+    assert_eq!(
+        fs::read_to_string(src.join("DOCS/readme")).unwrap(),
+        "second"
+    );
+    assert!(
+        !dst.exists(),
+        "fail before creating destination directories"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn source_symlink_before_parent_component_is_rejected() {
+    use std::os::unix::fs::symlink;
+    let t = TempDir::new().unwrap();
+    let x = t.path().join("x");
+    let a = t.path().join("a");
+    let dst = t.path().join("dst");
+    fs::create_dir_all(&x).unwrap();
+    fs::create_dir_all(a.join("b")).unwrap();
+    symlink("../a/b", x.join("lnk")).unwrap();
+    write(&x.join("f.txt"), "DON'T MOVE THIS");
+    write(&a.join("f.txt"), "KERNEL WOULD MOVE THIS");
+    let weird = x.join("lnk/../f.txt");
+    let result = mch(&["--move", weird.to_str().unwrap(), dst.to_str().unwrap()]);
+    assert_error(result);
+    assert_eq!(
+        fs::read_to_string(x.join("f.txt")).unwrap(),
+        "DON'T MOVE THIS"
+    );
+    assert_eq!(
+        fs::read_to_string(a.join("f.txt")).unwrap(),
+        "KERNEL WOULD MOVE THIS"
+    );
+    assert!(!dst.exists());
 }
 
 #[test]
@@ -1323,4 +1583,150 @@ fn resume_publishes_original_unix_permissions_after_private_staging() {
     );
     assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
     assert!(!partial.exists());
+}
+
+#[test]
+fn preflight_preserves_every_input_in_overwrite_batches() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("input");
+    let dest = tmp.path().join("out");
+    let prior = dest.join("input");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir_all(&prior).unwrap();
+    write(&source.join("item"), "first input");
+    let another = prior.join("item");
+    write(&another, "second input");
+    for mode in [vec!["--overwrite"], vec!["--move", "--overwrite"]] {
+        let mut args = mode;
+        args.extend([
+            source.to_str().unwrap(),
+            another.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ]);
+        assert_error(mch(&args));
+        assert_eq!(fs::read_to_string(&another).unwrap(), "second input");
+        assert_eq!(
+            fs::read_to_string(source.join("item")).unwrap(),
+            "first input"
+        );
+        assert!(!dest.join("item").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn overwrite_keeps_existing_socket_and_source() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixListener;
+
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("file");
+    let target = tmp.path().join("socket");
+    write(&source, "original");
+    let _listener = UnixListener::bind(&target).unwrap();
+    assert_error(mch(&[
+        "--overwrite",
+        source.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]));
+    assert!(
+        fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+    assert_eq!(fs::read_to_string(&source).unwrap(), "original");
+}
+
+#[test]
+fn only_contents_never_writes_back_into_a_source_tree() {
+    for ancestor_depth in [1, 2] {
+        for moving in [false, true] {
+            for overwrite in [false, true] {
+                for workers in ["1", "4"] {
+                    let tmp = TempDir::new().unwrap();
+                    let relative = if ancestor_depth == 1 {
+                        Path::new("input")
+                    } else {
+                        Path::new("outer/input")
+                    };
+                    let source = tmp.path().join(relative);
+                    let nested = source.join(relative);
+                    fs::create_dir_all(&nested).unwrap();
+                    write(&source.join("original"), "preserve me");
+                    write(&nested.join("later"), "separate input");
+                    let mut args = vec!["-O", "--count", workers];
+                    if moving {
+                        args.push("--move");
+                    }
+                    if overwrite {
+                        args.push("--overwrite");
+                    }
+                    args.extend([source.to_str().unwrap(), tmp.path().to_str().unwrap()]);
+                    assert_error(mch(&args));
+                    assert_eq!(
+                        fs::read_to_string(source.join("original")).unwrap(),
+                        "preserve me"
+                    );
+                    assert_eq!(
+                        fs::read_to_string(nested.join("later")).unwrap(),
+                        "separate input"
+                    );
+                    assert!(!source.join("later").exists());
+                    assert!(!tmp.path().join("original").exists());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_long_paths_support_copy_and_planned_overwrite() {
+    let tmp = TempDir::new().unwrap();
+    let mut dir = tmp.path().to_path_buf();
+    while dir.as_os_str().len() < 285 {
+        dir.push("long-destination-directory");
+    }
+    fs::create_dir_all(&dir).unwrap();
+    let src = tmp.path().join("source");
+    let dst = dir.join("destination");
+    write(&src, "copied");
+    assert_success(mch(&[src.to_str().unwrap(), dst.to_str().unwrap()]));
+    write(&src, "replacement");
+    assert_success(mch(&[
+        "--move",
+        "--overwrite",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]));
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "replacement");
+    assert!(!src.exists());
+}
+
+#[test]
+fn missing_component_before_parent_cannot_redirect_a_batch_into_an_input() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("tree");
+    let other = tmp.path().join("separate");
+    fs::create_dir(&source).unwrap();
+    write(&source.join("payload"), "original tree");
+    write(&other, "original file");
+    let dest = tmp.path().join("absent").join("..").join("tree");
+    for mode in [vec!["--count", "4"], vec!["--move", "--overwrite"]] {
+        let mut args = mode;
+        args.extend([
+            other.to_str().unwrap(),
+            source.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ]);
+        assert_error(mch(&args));
+        assert!(!tmp.path().join("absent").exists());
+        assert!(!source.join("separate").exists());
+        assert_eq!(
+            fs::read_to_string(source.join("payload")).unwrap(),
+            "original tree"
+        );
+        assert_eq!(fs::read_to_string(&other).unwrap(), "original file");
+    }
 }

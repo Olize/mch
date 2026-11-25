@@ -2,7 +2,7 @@
 
 **MCH** is a Rust command-line tool for copying or moving local files and directory trees with optional post-copy integrity verification. Its default hash is **BLAKE3**.
 
-Current version: **0.2.2**. Licensed under **GNU AGPL-3.0-or-later**.
+Current version: **0.2.3**. Licensed under **GNU AGPL-3.0-or-later**.
 
 ## Features
 
@@ -21,7 +21,7 @@ Current version: **0.2.2**. Licensed under **GNU AGPL-3.0-or-later**.
 
 ## Install
 
-Version 0.2.2 adds separate downloadable Linux AArch64 and native Android/Termux AArch64 binaries alongside Linux x86_64, Windows x86_64 and macOS Apple Silicon. See the [GitHub Releases](https://github.com/Olize/mch/releases) page for the package matching your architecture and verify it against \`SHA256SUMS.txt\` before use. **Linux AArch64 (glibc) is not a Termux binary**; Android/Termux requires the \`android-aarch64-termux\` archive with the Android Bionic linker.
+The published release includes separate downloadable Linux AArch64 and native Android/Termux AArch64 binaries alongside Linux x86_64, Windows x86_64 and macOS Apple Silicon. See the [GitHub Releases](https://github.com/Olize/mch/releases) page for the package matching your architecture and verify it against `SHA256SUMS.txt` before use. **Linux AArch64 (glibc) is not a Termux binary**; Android/Termux requires the `android-aarch64-termux` archive with the Android Bionic linker.
 
 To build from source instead, the Rust toolchain with Cargo is required.
 
@@ -80,7 +80,8 @@ mch --help
 | `--preserve-times` | Preserve original access and modification times on files and newly created directories; also symlinks on Unix |
 | `--resume` | Opt-in, verified restart of a single regular file on Unix; rejects `-N`, directories, multiple files and Windows |
 | `-O, --only-src-content` | Copy only the contents of one directory |
-| `--overwrite` | Explicitly replace existing files or symlinks |
+| `--overwrite` | Replace a destination present at planning after rechecking its identity |
+| `--allow-nonatomic-publish` | macOS only. On an unsupported filesystem, allow a verified regular-file copy into a newly created target. An interrupted copy can leave a partial target. |
 | `--dry-run` | Check and show plan without modifying files |
 | `-q, --quiet` | Suppress normal status output |
 | `--no-color` | Disable ANSI colors |
@@ -109,9 +110,9 @@ mch --resume --progress always large.iso /backup/large.iso
 - Verification normally reads the operating-system **page cache** after writing; equal hashes do not prove that media/controller data has been durably written or will survive a power loss.
 - During explicit overwrites and moves, MCH synchronizes staged regular file contents and on Unix also synchronizes affected destination directory entries. Actual power-loss durability still depends on the filesystem and hardware.
 - MCH checks the planned paths before copying and performs verification before committing each file. It does not take a filesystem snapshot. If sources change during copying, verification may fail; sources must be kept stable for reliable results.
-- An error partway through an operation may leave some **completed** destination files or newly created directories behind. New directories can temporarily retain default permissions/timestamps until finalization succeeds. Sources are retained if copying or verification fails. It is safe to inspect the destination and retry, using `--overwrite` if appropriate.
+- An error partway through an operation may leave some **completed** destination files or newly created directories behind. New Unix ancestors without a corresponding source directory keep mode 0700. Directories corresponding to a source receive its permissions after copying. Sources are retained if copying or verification fails. It is safe to inspect the destination and retry, using `--overwrite` if appropriate.
 - For a successful `--move`, original sources are deleted after verification. Deleting originals can itself fail, in which case both copies may remain. Do not assume an all-or-nothing transaction across sources.
-- `--overwrite` is atomic per regular file on Unix when source and destination are on the same mounted destination filesystem: the temporary file is created alongside its destination and renamed into place. On Windows, replacement may temporarily rename the old destination to a backup first; it is **not** an atomic replacement guarantee.
+- `--overwrite` is atomic per regular file on Unix when source and destination are on the same mounted destination filesystem: the temporary file is created alongside its destination and renamed into place. MCH uses the operating system’s same-directory rename for an existing target. Concurrent changes between rechecking the destination and renaming are outside the guarantee.
 - When `--overwrite` is not specified, existing regular files and links are never replaced. Existing destination directories may be merged; conflicting files are still rejected.
 - Symbolic links are preserved on Unix, but their *textual targets* are checked rather than hashing the objects they refer to. Windows symbolic-link copying is rejected.
 - `--preserve-times` optionally restores file access/modification times, newly created directory times, and Unix symlink times. Existing destination directories are never assigned source timestamps. Without this option, timestamps are not preserved intentionally. Timestamp operations can fail on unsupported filesystems and are not guarantees against external changes.
@@ -120,9 +121,10 @@ mch --resume --progress always large.iso /backup/large.iso
 - Destination paths whose existing parent components are symbolic links are rejected deliberately to avoid writing through an unexpected alias. On macOS, the standard system-managed `/var`, `/tmp`, and `/etc` aliases into `/private` are normalized after verifying their expected targets; other symlink parents remain forbidden.
 - MCH reads both source and staged target for a hash comparison, usually **from the operating system's page cache**. This detects mismatches visible through filesystem reads but **does not establish physical-media durability or prove that the controller stored the data correctly**.
 - For `--move` on Unix, MCH syncs staged data and relevant destination directory entries before removing planned sources. Actual power-loss durability still depends on the operating system and filesystem; source-directory deletion is not itself transactionally committed. On Windows, no equivalent directory-fsync guarantee is claimed.
-- If copying fails after creating destination directories, partially created directories may retain default mode/timestamps until a later successful run. Inspect partial results before retrying, especially when copying restrictive directory permissions.
+- If copying fails after creating destination directories, partially created directories may retain their initial restrictive mode and timestamps until a later successful run. Inspect partial results before retrying, especially when copying restrictive directory permissions.
 - MCH does not protect against concurrent malicious filesystem mutation (TOCTOU), disk/controller faults below the filesystem, or corruption that occurs after verification.
-- Using `-N` disables post-copy integrity verification, including for moves.
+- With `-N`, ordinary copies skip the staged hash check. Before deleting any move sources, MCH still verifies the final regular-file contents with BLAKE3, checks symlink targets and verifies distinct destination identities. Windows refuses multi-file `--move --overwrite`.
+- The macOS non-atomic option requires hashing and is incompatible with move, overwrite and resume. The default remains atomic no-replace or refusal. Files may be visible before completion only with the explicit opt-in.
 
 Return code: **0** for success, **2** for errors (argument errors from Clap may also use its own exit status).
 
@@ -135,7 +137,7 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-The GitHub Actions CI checks builds and tests on Linux, macOS, and Windows.
+Linux builds and tests run on SRV, Windows tests run in its Windows 11 VM, and Apple Silicon checks run on GitHub macOS.
 
 See [Specification](docs/SPECIFICATION.md) and [Changelog](CHANGELOG.md).
 

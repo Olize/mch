@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3 — 2026-11-25
+
+- Refuse a transfer before writing when an output falls inside a source tree, overwrites any input to the batch, or would replace a special file.
+- Recheck every file and directory destination before removing move sources. Keep distinct non-UTF-8 Unix names intact and refuse ambiguous case or Unicode destination names.
+- Recheck planned overwrite targets and protect new targets with exclusive publication. Windows retains the restriction on multi-file moves with overwrite.
+- Create new Unix destination ancestors privately. Reject ambiguous paths containing a symbolic link followed by a parent traversal.
+- Copy and move directories to the root of Windows FAT32 and exFAT volumes.
+- Support exclusive publication on Windows exFAT. On macOS, an explicit opt-in permits verified regular-file copies on filesystems without exclusive rename. Interrupted opt-in copies may leave an incomplete target.
+- Refresh locked dependencies and verify the Unix single-file resume path separately from ordinary transfers.
+
 ## 0.2.2 — 2026-10-22
 
 - Add separate official release archives for Linux AArch64 (GNU/glibc) and native Android/Termux AArch64 (Bionic), with binary ABI checks and SHA-256 sums for all downloads.

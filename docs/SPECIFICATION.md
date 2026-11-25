@@ -1,4 +1,4 @@
-# Technical specification — MCH 0.2.1
+# Technical specification — MCH 0.2.3
 
 Status: implementation contract, not a formal safety proof.
 
@@ -13,7 +13,7 @@ Supports regular files, directory trees and Unix symlinks; does not copy sockets
 ## Options
 
 - -m, --move: remove original sources after all copy and verification tasks succeed.
-- -N, --no-hash: skip content verification.
+- -N, --no-hash: skip staged verification. Moves still check all final destinations before deletion.
 - --hash: BLAKE3 (default), SHA256, SHA512, SHA3-256, SHA3-512, BLAKE2B, BLAKE2S, XXH3.
 - --count N: 1–256 parallel file workers (default 1); individual large files are not split into chunks.
 - -O: copy only directory contents.
@@ -30,8 +30,8 @@ Supports regular files, directory trees and Unix symlinks; does not copy sockets
 
 1. Normalize source and target paths, enumerate source trees, check targets and detect collisions and self-recursive copies. If --preserve-times is enabled, snapshot timestamps of all source files and links during planning, before processing any data.
 2. Create missing destination directories without traversing existing symlink parents. Sum planned regular-file sizes for progress; this is an estimate if source files are modified by another process.
-3. Copy regular files into temporary files alongside their destinations. When progress is displayed, read and write in 1 MiB blocks and count bytes; otherwise use platform-optimized fs::copy for speed. When enabled, independently hash the original and staged copy and compare them. Symlinks are recreated, not dereferenced, and link text is compared.
-4. With --preserve-times, apply original timestamps to the staged file/link only after copying and hashing succeed; restore timestamps of newly created directories after all children are written. Pre-existing target directories keep their own timestamps aside from normal filesystem updates. Publish staged files with rename. On Unix this gives per-file atomic replacement on the destination filesystem. On Windows replacement may require moving the original aside first.
+3. Copy regular files into temporary files alongside their destinations. When progress is displayed, read and write in 1 MiB blocks and count bytes; otherwise use std::io::copy on the open source and staging handles. When enabled, independently hash the original and staged copy and compare them. Symlinks are recreated, not dereferenced, and link text is compared.
+4. With --preserve-times, apply original timestamps to the staged file/link only after copying and hashing succeed; restore timestamps of newly created directories after all children are written. Pre-existing target directories keep their own timestamps aside from normal filesystem updates. Publish staged files with rename. On Unix this gives per-file atomic replacement on the destination filesystem. Existing-target overwrites use the same-directory OS rename after checking the planned entry again. A target absent at planning uses exclusive no-replace publication.
 5. Restore permissions on new directory objects and delete original sources only after all copy tasks complete successfully.
 
 Preflight errors must leave originals untouched. Failures in the copy phase retain originals but may leave successfully copied destination files behind. Errors during final source deletion can leave some originals intact and some removed. MCH is NOT an all-or-nothing transaction.
@@ -56,6 +56,8 @@ Preflight errors must leave originals untouched. Failures in the copy phase reta
 
 ## Limitations and security boundaries
 
+- Empty-destination copies still reject planned target directories inside any source tree. Case- or NFC-equivalent planned names can be refused even on case-sensitive filesystems. With -O --move the source root is removed after its contents are moved. Newly created Unix ancestors with no source counterpart retain mode 0700.
+- Directory overlap and move checks require stable, unique file identities. Network shares, nonstandard filesystem drivers and ReFS have not been validated for this release. Windows FAT32 and exFAT volume roots must be registered with Mount Manager. Cloned volumes with identical serials can cause an overlap refusal.
 - No filesystem snapshots: sources should remain unchanged while MCH runs.
 - Concurrency with a hostile filesystem actor creates race conditions (TOCTOU), and is not defended against.
 - No absolute durability guarantees after power loss. Unix moves sync staged regular files and affected destination directories before deleting source files. Unix resume synchronizes the stage and, for resume moves, the final destination directory before source deletion; noncooperating filesystems/controllers remain outside the guarantee.
@@ -63,7 +65,8 @@ Preflight errors must leave originals untouched. Failures in the copy phase reta
 - Unix symlinks are preserved as links; Windows symlink copying is unsupported.
 - Destination paths with preexisting symlink ancestors are refused intentionally, except verified macOS system roots `/var`, `/tmp` and `/etc`, which are normalized to `/private` before checking.
 - Non-local/cloud file systems can have unusual rename behavior.
-- With -N, the integrity checks are explicitly disabled.
+- A successful move rechecks final file contents, link targets, directory existence and destination identities even with -N. Windows refuses multi-file move with overwrite.
+- macOS may explicitly opt into verified, exclusive target creation when atomic no-replace fails on an unsupported filesystem. The destination may be visible while being filled and may be incomplete after interruption or a write error. This option rejects move, overwrite, no-hash and resume.
 - Progress estimates only the data-transfer phase; verification, metadata application and deleting sources are not included in the copy ETA. Progress "COPY VERIFIED" refers to hashed/copied files, not the entire move operation. With -N, the final progress state is explicitly "COPY COMPLETE (NO HASH VERIFICATION)".
 - Line-based output is intended for screen readers; automatic progress is enabled only if stderr is connected to a terminal.
 - Temporary files may remain if the process is killed or power fails.
