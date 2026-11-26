@@ -17,7 +17,7 @@ cargo fmt --all -- --check
 echo "[srv-ci] Clippy"
 cargo clippy --locked --all-targets -- -D warnings
 echo "[srv-ci] Rust unit and CLI integration tests"
-cargo test --locked --all-targets
+cargo test --locked --all-targets -- --include-ignored
 echo "[srv-ci] Optimized public binary"
 cargo build --release --locked
 out=$(cargo metadata --locked --offline --no-deps --format-version=1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')

@@ -1,4 +1,4 @@
-# Technical specification — MCH 0.2.3
+# Technical specification — MCH 0.3.0
 
 Status: implementation contract, not a formal safety proof.
 
@@ -34,7 +34,7 @@ Supports regular files, directory trees and Unix symlinks; does not copy sockets
 4. With --preserve-times, apply original timestamps to the staged file/link only after copying and hashing succeed; restore timestamps of newly created directories after all children are written. Pre-existing target directories keep their own timestamps aside from normal filesystem updates. Publish staged files with rename. On Unix this gives per-file atomic replacement on the destination filesystem. Existing-target overwrites use the same-directory OS rename after checking the planned entry again. A target absent at planning uses exclusive no-replace publication.
 5. Restore permissions on new directory objects and delete original sources only after all copy tasks complete successfully.
 
-Preflight errors must leave originals untouched. Failures in the copy phase retain originals but may leave successfully copied destination files behind. Errors during final source deletion can leave some originals intact and some removed. MCH is NOT an all-or-nothing transaction.
+Preflight errors must leave originals untouched. Failures in the copy phase retain originals but may leave successfully copied destination files behind. Errors during final source deletion can leave some originals intact and some removed. These rules describe ordinary copying and moving. Atomic Linux directory transactions are specified below.
 
 ## Unix resume protocol v1 (opt-in, supported scope)
 
@@ -58,18 +58,30 @@ Preflight errors must leave originals untouched. Failures in the copy phase reta
 
 - Empty-destination copies still reject planned target directories inside any source tree. Case- or NFC-equivalent planned names can be refused even on case-sensitive filesystems. With -O --move the source root is removed after its contents are moved. Newly created Unix ancestors with no source counterpart retain mode 0700.
 - Directory overlap and move checks require stable, unique file identities. Network shares, nonstandard filesystem drivers and ReFS have not been validated for this release. Windows FAT32 and exFAT volume roots must be registered with Mount Manager. Cloned volumes with identical serials can cause an overlap refusal.
-- No filesystem snapshots: sources should remain unchanged while MCH runs.
+- Ordinary copies require a stable source. Linux copies can select a retained read-only Btrfs snapshot.
 - Concurrency with a hostile filesystem actor creates race conditions (TOCTOU), and is not defended against.
 - No absolute durability guarantees after power loss. Unix moves sync staged regular files and affected destination directories before deleting source files. Unix resume synchronizes the stage and, for resume moves, the final destination directory before source deletion; noncooperating filesystems/controllers remain outside the guarantee.
-- No preservation guarantee for owner, ACL, xattrs, creation times, sparse extents or hard-link relationships. Basic file permissions and newly created directory permissions are handled. Access and modification timestamps are an explicit opt-in; filesystem precision and time metadata support vary.
+- For ordinary copies there is no preservation guarantee for owner, ACL, xattrs, creation times, sparse extents or hard-link relationships. Basic file permissions and newly created directory permissions are handled. Access and modification timestamps are an explicit opt-in; filesystem precision and time metadata support vary.
 - Unix symlinks are preserved as links; Windows symlink copying is unsupported.
 - Destination paths with preexisting symlink ancestors are refused intentionally, except verified macOS system roots `/var`, `/tmp` and `/etc`, which are normalized to `/private` before checking.
 - Non-local/cloud file systems can have unusual rename behavior.
 - A successful move rechecks final file contents, link targets, directory existence and destination identities even with -N. Windows refuses multi-file move with overwrite.
 - macOS may explicitly opt into verified, exclusive target creation when atomic no-replace fails on an unsupported filesystem. The destination may be visible while being filled and may be incomplete after interruption or a write error. This option rejects move, overwrite, no-hash and resume.
-- Progress estimates only the data-transfer phase; verification, metadata application and deleting sources are not included in the copy ETA. Progress "COPY VERIFIED" refers to hashed/copied files, not the entire move operation. With -N, the final progress state is explicitly "COPY COMPLETE (NO HASH VERIFICATION)".
+- The copy ETA measures transfer. Verified ordinary copies also report a copy-plus-hash ETA covering the two independent hash reads. Both estimates exclude metadata application and source removal. Progress "COPY VERIFIED" refers to hashed/copied files, not the entire move operation. With -N, the final progress state is explicitly "COPY COMPLETE (NO HASH VERIFICATION)".
 - Line-based output is intended for screen readers; automatic progress is enabled only if stderr is connected to a terminal.
 - Temporary files may remain if the process is killed or power fails.
+
+## Directory resume, sparse copying and transactions
+
+`mch --resume-dir --resume-dir-state STATE SOURCE TARGET` copies one local Unix directory into an existing target using BLAKE3 and one worker. Use a dedicated, owner-private state directory (0700) outside both trees. Only regular files without additional hard links and directories are supported. Repeat the same command after interruption. Previously published files are rehashed and completed files are checked against their recorded digest before success. The final walk also requires every planned target directory, including empty directories. Preserve the state if the job refuses recovery.
+
+On a sparse-capable volume, `--sparse` writes all-zero blocks as holes in an ordinary copy. The logical length and contents are preserved, including a trailing hole. Windows requires a target that supports setting the sparse-file attribute.
+
+On Linux, `mch --transaction STATE SOURCE TARGET` verifies and syncs an entire directory before publishing it at TARGET. The destination parent and private state directory must exist on the same filesystem. The default requires TARGET to be absent. Add `--replace-tree` to exchange an existing target with the staged directory. The original directory remains in STATE. Repeat the same command with `--rollback` to restore the original target or its absence. The withdrawn tree, including edits after publication, is retained in STATE. MCH serializes the destination check and rename with other MCH transactions in the same parent. If the parent is busy, retry the same command. Keep the state directory while rollback may be needed.
+
+Transactions require Linux 5.8 or later, rsync with ACL/xattr support and a filesystem with directory birth times, directory sync and the necessary atomic rename operations. They verify contents with BLAKE3 and preserve hardlinks, sparse data, numeric ownership, permissions, modification times, POSIX ACLs and extended attributes visible to rsync. Transactions preserve modification times. They reject `--preserve-times`, which also requests access times. Run with sufficient permission to reproduce the selected metadata. Use a stable source and privately controlled state and destination paths.
+
+On Linux Btrfs, `--snapshot-in DIR` creates a read-only subvolume named after the source inside DIR. The parent must be on the same filesystem outside the source, and the snapshot name must be unused. Nested subvolumes and mount boundaries are refused. The snapshot is retained even after a later copy failure. For retries, use its path directly as the source.
 
 ## Release gates
 

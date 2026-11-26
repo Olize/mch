@@ -2,7 +2,7 @@
 
 **MCH** is a Rust command-line tool for copying or moving local files and directory trees with optional post-copy integrity verification. Its default hash is **BLAKE3**.
 
-Current version: **0.2.3**. Licensed under **GNU AGPL-3.0-or-later**.
+Current version: **0.3.0**. See the [technical specification](docs/SPECIFICATION.md) for mode requirements and recovery behavior. Licensed under **GNU AGPL-3.0-or-later**.
 
 ## Features
 
@@ -77,6 +77,13 @@ mch --help
 | `--hash ALGORITHM` | Select hash algorithm; default BLAKE3 |
 | `--count N` | Number of parallel file workers; default 1, max 256 |
 | `--progress auto|always|never` | Screenreader-friendly transfer status; default auto (only when stderr is a terminal) |
+| `--progress-interval-ms N` | Interval between progress updates in milliseconds. The default is 1000. |
+| `--sparse` | Write zero-filled blocks as holes on a sparse-capable target. |
+| `--resume-dir --resume-dir-state DIR` | Resume a verified copy of a single Unix directory into an existing target using a dedicated private state directory. |
+| `--transaction STATE` | On Linux, stage and verify a whole directory before publishing it under the exact destination name. |
+| `--replace-tree` | With a transaction, exchange an existing destination with the staged tree. The previous tree is retained. |
+| `--rollback` | Withdraw a transaction and restore the previous directory or its original absence. |
+| `--snapshot-in DIR` | Take a retained read-only snapshot of a Linux Btrfs subvolume before copying. |
 | `--preserve-times` | Preserve original access and modification times on files and newly created directories; also symlinks on Unix |
 | `--resume` | Opt-in, verified restart of a single regular file on Unix; rejects `-N`, directories, multiple files and Windows |
 | `-O, --only-src-content` | Copy only the contents of one directory |
@@ -92,7 +99,7 @@ When copying a directory **without** `-O`, the source directory name is always a
 
 With `-N`, the final progress status explicitly says **COPY COMPLETE (NO HASH VERIFICATION)**; MCH must never report an unverified copy as verified.
 
-Progress messages appear on stderr as separate, readable lines (at most once per second plus a final copy summary). They report bytes transferred, copied-file count, approximate throughput and **copy ETA**, not a guaranteed end-to-end ETA; hash verification and source deletion take additional time. `--progress always` works with redirected logs. `--quiet` and `--dry-run` suppress progress. No animated progress bars or ANSI control sequences are used in progress output.
+Ordinary copies report progress on stderr in plain text. The default is one update per second plus a final summary. With hashing enabled, MCH estimates both the remaining copy time and the time to finish copying and reading back the source and staged file. The estimate excludes final metadata work and move-source deletion. Use `--progress always --progress-interval-ms 250` for updates every quarter second in a redirected log. `--quiet` and `--dry-run` suppress progress.
 
 ### Verified resumable copies (Unix single-file mode)
 
@@ -116,9 +123,9 @@ mch --resume --progress always large.iso /backup/large.iso
 - When `--overwrite` is not specified, existing regular files and links are never replaced. Existing destination directories may be merged; conflicting files are still rejected.
 - Symbolic links are preserved on Unix, but their *textual targets* are checked rather than hashing the objects they refer to. Windows symbolic-link copying is rejected.
 - `--preserve-times` optionally restores file access/modification times, newly created directory times, and Unix symlink times. Existing destination directories are never assigned source timestamps. Without this option, timestamps are not preserved intentionally. Timestamp operations can fail on unsupported filesystems and are not guarantees against external changes.
-- Directory ownership, hard-link relationships, extended attributes, ACLs, birth/creation times and sparse extents are **not** preserved. Do not use MCH as a metadata-perfect backup.
+- Ordinary copies preserve basic permissions. Use `--sparse` to convert zero-filled blocks into holes. Linux directory transactions also preserve ownership, hardlink relationships, ACLs and visible extended attributes. Creation times and exact physical extent layouts are outside the preservation contract.
 - Special files (devices, sockets, FIFOs) are not copied.
-- Destination paths whose existing parent components are symbolic links are rejected deliberately to avoid writing through an unexpected alias. On macOS, the standard system-managed `/var`, `/tmp`, and `/etc` aliases into `/private` are normalized after verifying their expected targets; other symlink parents remain forbidden.
+- For ordinary copies and moves, destination paths whose existing parent components are symbolic links are rejected deliberately to avoid writing through an unexpected alias. On macOS, the standard system-managed `/var`, `/tmp`, and `/etc` aliases into `/private` are normalized after verifying their expected targets; other symlink parents remain forbidden.
 - MCH reads both source and staged target for a hash comparison, usually **from the operating system's page cache**. This detects mismatches visible through filesystem reads but **does not establish physical-media durability or prove that the controller stored the data correctly**.
 - For `--move` on Unix, MCH syncs staged data and relevant destination directory entries before removing planned sources. Actual power-loss durability still depends on the operating system and filesystem; source-directory deletion is not itself transactionally committed. On Windows, no equivalent directory-fsync guarantee is claimed.
 - If copying fails after creating destination directories, partially created directories may retain their initial restrictive mode and timestamps until a later successful run. Inspect partial results before retrying, especially when copying restrictive directory permissions.

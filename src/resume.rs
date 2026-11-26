@@ -242,7 +242,8 @@ mod unix {
             let reporter = if cli.show_progress() {
                 Some(scope.spawn(move || {
                     loop {
-                        match receiver.recv_timeout(Duration::from_secs(1)) {
+                        match receiver.recv_timeout(Duration::from_millis(cli.progress_interval_ms))
+                        {
                             Ok(()) | Err(RecvTimeoutError::Disconnected) => {
                                 show_transfer(
                                     tracker.load(Ordering::Relaxed),

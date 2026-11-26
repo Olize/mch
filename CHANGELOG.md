@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 — 2026-11-26
+
+- Add verified Unix directory resume and sparse-file copies on supported Unix and Windows filesystems.
+- Add atomic Linux directory transactions with rollback, metadata preservation and optional read-only Btrfs source snapshots.
+- Include empty target directories in final resume verification. Coordinate directory publication and rollback across independent state directories.
+- Reject an explicit request for access-time preservation in directory transactions before starting the job.
+- Report configurable progress intervals and estimated time for both copying and verifying.
+
 ## 0.2.3 — 2026-11-25
 
 - Refuse a transfer before writing when an output falls inside a source tree, overwrites any input to the batch, or would replace a special file.

@@ -1,6 +1,6 @@
 [package]
 name = "mch"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Mighty Copy with Hash (mch) - copy/move with post-copy verification (default: BLAKE3)."
@@ -8,7 +8,8 @@ repository = "https://github.com/Olize/mch"
 readme = "README.md"
 
 [package.metadata.mch-release]
-approved_unix_resume = "v1-single-regular-file-reviewed-0.2.3-move-safety"
+approved_unix_resume = "v1-single-file-and-v2-directory-reviewed-0.3.0"
+reviewed_runtime = "41e8b21979e9cc127e91c8f416a90108e39cc050"
 
 [dependencies]
 anyhow = "1"
@@ -28,7 +29,7 @@ unicode-normalization = "0.1.24"
 libc = "0.2"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
 
 [dev-dependencies]
 tempfile = "3"
