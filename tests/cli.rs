@@ -1751,7 +1751,7 @@ fn make_directory_resume_fixture() -> (
     (tmp, src, dst, state)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn dir_resume(src: &Path, dst: &Path, state: &Path, other: &[&str]) -> Output {
     let mut args = vec![
         "--resume-dir",
@@ -2026,28 +2026,78 @@ fn resume_dir_rejects_ambiguous_names_before_creating_state_or_targets() {
 
 #[cfg(windows)]
 #[test]
-fn windows_directory_resume_refuses_before_creating_target_or_state() {
-    let tmp = TempDir::new().unwrap();
-    let src = tmp.path().join("source");
-    let dst = tmp.path().join("destination");
-    let state = tmp.path().join("state");
-    for directory in [&src, &dst, &state] {
-        fs::create_dir(directory).unwrap();
+fn windows_resume_refuses_an_open_writer_and_identifies_the_blocked_tree_file() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("source");
+    let dst = temp.path().join("target");
+    let state = temp.path().join("state");
+    for path in [&src, &dst, &state] {
+        fs::create_dir(path).unwrap();
     }
-    write(&src.join("file"), "source data");
-    let run = mch(&[
-        "--quiet",
-        "--resume-dir",
-        "--resume-dir-state",
-        state.to_str().unwrap(),
-        src.to_str().unwrap(),
-        dst.to_str().unwrap(),
-    ]);
-    assert!(String::from_utf8_lossy(&run.stderr).contains("only on Unix"));
-    assert_error(run);
+    let child = src.join("busy document.txt");
+    write(&child, "original content");
+    // The writer allows sharing. MCH's read lock must still refuse this source.
+    let writer = fs::OpenOptions::new().write(true).open(&child).unwrap();
+    let single = temp.path().join("single.txt");
+    let copy_single = || {
+        mch(&[
+            "--resume",
+            child.to_str().unwrap(),
+            single.to_str().unwrap(),
+        ])
+    };
+    assert_error(copy_single());
+    assert!(!single.exists());
+
+    let copy_tree = || dir_resume(&src, &dst, &state, &[]);
+    let blocked = copy_tree();
+    assert!(!blocked.status.success());
+    let message = String::from_utf8_lossy(&blocked.stderr);
+    assert!(message.contains("busy document.txt"), "{message}");
     assert_eq!(fs::read_dir(&dst).unwrap().count(), 0);
     assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
-    assert_eq!(fs::read(src.join("file")).unwrap(), b"source data");
+
+    drop(writer);
+    assert_success(copy_single());
+    assert_success(copy_tree());
+    assert_eq!(fs::read(single).unwrap(), b"original content");
+    assert_eq!(
+        fs::read(dst.join("busy document.txt")).unwrap(),
+        b"original content"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_directory_resume_revalidates_completed_files_and_empty_directories() {
+    let t = TempDir::new().unwrap();
+    let src = t.path().join("source");
+    let dst = t.path().join("destination");
+    let state = t.path().join("state");
+    for p in [&src, &dst, &state] {
+        fs::create_dir(p).unwrap();
+    }
+    fs::create_dir(src.join("empty")).unwrap();
+    write(&src.join("file"), "copied bytes");
+    let run = || {
+        mch(&[
+            "--resume-dir",
+            "--resume-dir-state",
+            state.to_str().unwrap(),
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+        ])
+    };
+    assert_success(run());
+    assert_success(run());
+    assert_eq!(fs::read(dst.join("file")).unwrap(), b"copied bytes");
+    write(&dst.join("file"), "other bytes");
+    assert_error(run());
+    assert_eq!(fs::read(dst.join("file")).unwrap(), b"other bytes");
+    write(&dst.join("file"), "copied bytes");
+    fs::remove_dir(dst.join("empty")).unwrap();
+    assert_error(run());
+    assert!(!dst.join("empty").exists());
 }
 
 #[test]
@@ -2165,4 +2215,23 @@ fn transaction_refuses_access_time_preservation_before_writing() {
     assert!(error.contains("--preserve-times") && error.contains("--transaction"));
     assert!(!target.exists());
     assert_eq!(fs::read_dir(state).unwrap().count(), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_resume_copies_to_new_target_and_rejects_destructive_modes() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Grüße source");
+    let dst = temp.path().join("Grüße target");
+    let args = [src.to_str().unwrap(), dst.to_str().unwrap()];
+    fs::write(&src, []).unwrap();
+    for flag in ["--move", "--overwrite"] {
+        assert_error(mch(&["--resume", flag, args[0], args[1]]));
+        assert!(src.exists() && !dst.exists());
+    }
+    assert_success(mch(&["--resume", "--dry-run", args[0], args[1]]));
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    assert_success(mch(&["--resume", "--preserve-times", args[0], args[1]]));
+    assert_eq!(fs::read(&dst).unwrap(), b"");
+    assert_error(mch(&["--resume", args[0], args[1]]));
 }

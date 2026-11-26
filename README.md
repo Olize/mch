@@ -2,7 +2,7 @@
 
 **MCH** is a Rust command-line tool for copying or moving local files and directory trees with optional post-copy integrity verification. Its default hash is **BLAKE3**.
 
-Current version: **0.3.0**. See the [technical specification](docs/SPECIFICATION.md) for mode requirements and recovery behavior. Licensed under **GNU AGPL-3.0-or-later**.
+Current version: **0.4.0**. See the [technical specification](docs/SPECIFICATION.md) for mode requirements and recovery behavior. Licensed under **GNU AGPL-3.0-or-later**.
 
 ## Features
 
@@ -79,13 +79,13 @@ mch --help
 | `--progress auto|always|never` | Screenreader-friendly transfer status; default auto (only when stderr is a terminal) |
 | `--progress-interval-ms N` | Interval between progress updates in milliseconds. The default is 1000. |
 | `--sparse` | Write zero-filled blocks as holes on a sparse-capable target. |
-| `--resume-dir --resume-dir-state DIR` | Resume a verified copy of a single Unix directory into an existing target using a dedicated private state directory. |
+| `--resume-dir --resume-dir-state DIR` | Resume one directory tree on Unix or local Windows NTFS. Windows requires an initially empty destination and a dedicated state directory on the destination volume. |
 | `--transaction STATE` | On Linux, stage and verify a whole directory before publishing it under the exact destination name. |
 | `--replace-tree` | With a transaction, exchange an existing destination with the staged tree. The previous tree is retained. |
 | `--rollback` | Withdraw a transaction and restore the previous directory or its original absence. |
 | `--snapshot-in DIR` | Take a retained read-only snapshot of a Linux Btrfs subvolume before copying. |
 | `--preserve-times` | Preserve original access and modification times on files and newly created directories; also symlinks on Unix |
-| `--resume` | Opt-in, verified restart of a single regular file on Unix; rejects `-N`, directories, multiple files and Windows |
+| `--resume` | Verified single-file restart on Unix or local Windows NTFS. Windows supports copy to a new file in an existing directory. |
 | `-O, --only-src-content` | Copy only the contents of one directory |
 | `--overwrite` | Replace a destination present at planning after rechecking its identity |
 | `--allow-nonatomic-publish` | macOS only. On an unsupported filesystem, allow a verified regular-file copy into a newly created target. An interrupted copy can leave a partial target. |
@@ -107,6 +107,17 @@ Ordinary copies report progress on stderr in plain text. The default is one upda
 mch --resume --progress always large.iso /backup/large.iso
 # If interrupted, repeat exactly the same command and paths.
 ```
+
+On Windows, `--resume` copies one regular NTFS file into an existing directory on a local NTFS drive. Repeat the same command after an interruption. MCH locks the source against changes, compares the saved prefix, and hashes the entire source and staging file before publishing a new destination. The resulting file keeps the owner-only access list used during staging. For a directory tree use `--resume-dir`. Windows resume is copy-only and refuses overwrites.
+
+To resume a Windows directory copy, create empty destination and state directories outside the source. Both must be on the same local NTFS volume. Keep the state directory for every retry. If MCH reports an incomplete NTFS identity in the journal, keep the old job and start a fresh copy with a new empty destination and state directory.
+
+```powershell
+New-Item -ItemType Directory -Path D:\Backup\Photos,D:\MCH-State\Photos
+mch --resume-dir --resume-dir-state D:\MCH-State\Photos C:\Photos D:\Backup\Photos
+```
+
+Repeat the second command after interruption. MCH verifies the source plan and existing target entries before continuing. Every destination file is published only after its full hash matches. The final check includes empty directories. A changed source, a replaced completed target or an extra destination entry causes an error. Staged and published entries have an owner-only access list. Keep both trees under your control.
 
 `--resume` supports one regular file per invocation on Unix (tested under Linux, macOS and Android/Termux). It writes a hidden owner-private `.mch-resume-v1-*.part` file alongside the destination; `.meta` binds that staging data to the initial source inode, size and modification time. A persistent `.lock` file is intentional so simultaneous resumes cannot bypass the inode lock. All previously written bytes are checked byte-for-byte against the current source on each restart; final source and staged-file hashes must match before publishing. Changing the source, altering the stage or having a conflicting destination causes a refusal, not an automatic repair. For `--resume --move`, the destination parent must already exist and support directory synchronization before the source may be deleted. The user may need to remove abandoned staging/manifest files **manually** after reviewing them. Concurrent hostile filesystem modifications, power loss and incomplete metadata/directory durability are outside the guarantees of this release. Do **not** treat this as a transactional backup, a crash-proof data store, or a safe workflow on untested network/FUSE filesystems.
 

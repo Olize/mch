@@ -28,10 +28,18 @@ pub(crate) fn hash_file_counted(
 ) -> Result<String> {
     let mut file =
         File::open(path).with_context(|| format!("open for hashing: {}", path.display()))?;
+    hash_open_file(&mut file, algorithm, progress)
+}
+
+pub(crate) fn hash_open_file(
+    file: &mut File,
+    algorithm: HashAlg,
+    progress: Option<&crate::progress::Progress>,
+) -> Result<String> {
     let mut buffer = vec![0_u8; 1024 * 1024];
 
     let mut read = |buffer: &mut [u8]| -> std::io::Result<usize> {
-        let n = read_retry(&mut file, buffer)?;
+        let n = read_retry(file, buffer)?;
         if let Some(tracker) = progress {
             tracker.add_hashed(n as u64);
         }

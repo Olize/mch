@@ -1473,6 +1473,7 @@ pub(crate) fn execute(cli: &Cli, plan: &Plan) -> Result<()> {
         {
             bail!("--resume only supports one regular file, not directories or symlinks");
         }
+        #[cfg(not(windows))]
         if cli.dry_run {
             cli.report(
                 &format!(

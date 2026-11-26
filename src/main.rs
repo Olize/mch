@@ -139,15 +139,15 @@ struct Cli {
     #[arg(long = "preserve-times")]
     preserve_times: bool,
 
-    /// Restart a partially copied single regular file (Unix only; experimental)
+    /// Restart a partially copied single regular file (experimental; Windows requires local NTFS and copy to a new file)
     #[arg(long = "resume")]
     resume: bool,
 
-    /// Experimental opt-in: resume copying all regular files in one directory tree (Unix)
+    /// Experimental opt-in: resume copying all regular files in one directory tree (Unix or local Windows NTFS)
     #[arg(long = "resume-dir", conflicts_with_all = ["resume", "allow_nonatomic_publish"])]
     resume_dir: bool,
 
-    /// Existing, private 0700 state directory for --resume-dir, outside both trees
+    /// Existing, dedicated private state directory for --resume-dir, outside both trees
     #[arg(long = "resume-dir-state", requires = "resume_dir")]
     resume_dir_state: Option<PathBuf>,
 
@@ -266,7 +266,16 @@ fn run() -> Result<()> {
                 "--resume currently supports exactly one regular source file, --count 1, without -O"
             );
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            if cli.overwrite || cli.move_mode {
+                anyhow::bail!(
+                    "Windows --resume requires copy to a new destination; --move and --overwrite are unsupported"
+                );
+            }
+            crate::resume::validate_windows_paths(&cli.sources[0], &cli.destination)?;
+        }
+        #[cfg(not(any(unix, windows)))]
         anyhow::bail!("--resume is not yet supported on this platform");
     }
     if cli.resume_dir {
@@ -285,8 +294,10 @@ fn run() -> Result<()> {
                 "--resume-dir requires one source directory, --resume-dir-state PATH, --count 1, BLAKE3; no --move, --overwrite, -O, -N, --dry-run, or --preserve-times"
             );
         }
-        #[cfg(not(unix))]
-        anyhow::bail!("--resume-dir is currently supported only on Unix");
+        #[cfg(windows)]
+        return resume::copy_directory(&cli);
+        #[cfg(not(any(unix, windows)))]
+        anyhow::bail!("--resume-dir is unsupported on this platform");
     }
     #[cfg(target_os = "linux")]
     {
