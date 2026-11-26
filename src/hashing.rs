@@ -18,15 +18,31 @@ fn read_retry(file: &mut File, buffer: &mut [u8]) -> std::io::Result<usize> {
 }
 
 pub(crate) fn hash_file(path: &Path, algorithm: HashAlg) -> Result<String> {
+    hash_file_counted(path, algorithm, None)
+}
+
+pub(crate) fn hash_file_counted(
+    path: &Path,
+    algorithm: HashAlg,
+    progress: Option<&crate::progress::Progress>,
+) -> Result<String> {
     let mut file =
         File::open(path).with_context(|| format!("open for hashing: {}", path.display()))?;
     let mut buffer = vec![0_u8; 1024 * 1024];
+
+    let mut read = |buffer: &mut [u8]| -> std::io::Result<usize> {
+        let n = read_retry(&mut file, buffer)?;
+        if let Some(tracker) = progress {
+            tracker.add_hashed(n as u64);
+        }
+        Ok(n)
+    };
 
     macro_rules! hash_digest {
         ($type:ty) => {{
             let mut hasher = <$type>::new();
             loop {
-                let n = read_retry(&mut file, &mut buffer)?;
+                let n = read(&mut buffer)?;
                 if n == 0 {
                     break;
                 }
@@ -40,7 +56,7 @@ pub(crate) fn hash_file(path: &Path, algorithm: HashAlg) -> Result<String> {
         HashAlg::Blake3 => {
             let mut hasher = blake3::Hasher::new();
             loop {
-                let n = read_retry(&mut file, &mut buffer)?;
+                let n = read(&mut buffer)?;
                 if n == 0 {
                     break;
                 }
@@ -57,7 +73,7 @@ pub(crate) fn hash_file(path: &Path, algorithm: HashAlg) -> Result<String> {
         HashAlg::Xxh3 => {
             let mut hasher = xxhash_rust::xxh3::Xxh3::new();
             loop {
-                let n = read_retry(&mut file, &mut buffer)?;
+                let n = read(&mut buffer)?;
                 if n == 0 {
                     break;
                 }

@@ -13,7 +13,7 @@ export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER=qemu-aarch64
 export QEMU_LD_PREFIX="${QEMU_LD_PREFIX:-/usr/aarch64-linux-gnu}"
 out=$(cargo metadata --offline --locked --format-version=1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
-cargo test --locked --all-targets --target aarch64-unknown-linux-gnu
+cargo test --locked --all-targets --target aarch64-unknown-linux-gnu -- --include-ignored
 cargo build --release --locked --target aarch64-unknown-linux-gnu
 arm="$out/aarch64-unknown-linux-gnu/release/mch"
 readelf -h "$arm" | grep -E 'Machine:[[:space:]]+AArch64'

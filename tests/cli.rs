@@ -1730,3 +1730,439 @@ fn missing_component_before_parent_cannot_redirect_a_batch_into_an_input() {
         assert_eq!(fs::read_to_string(&other).unwrap(), "original file");
     }
 }
+
+#[cfg(unix)]
+fn make_directory_resume_fixture() -> (
+    TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let src = root.join("src");
+    let dst = root.join("dst");
+    let state = root.join("state");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    (tmp, src, dst, state)
+}
+
+#[cfg(unix)]
+fn dir_resume(src: &Path, dst: &Path, state: &Path, other: &[&str]) -> Output {
+    let mut args = vec![
+        "--resume-dir",
+        "--resume-dir-state",
+        state.to_str().unwrap(),
+    ];
+    args.extend_from_slice(other);
+    args.push(src.to_str().unwrap());
+    args.push(dst.to_str().unwrap());
+    mch(&args)
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_dir_copies_nested_empty_and_existing_files_then_rechecks_on_restart() {
+    let (_tmp, src, dst, state) = make_directory_resume_fixture();
+    fs::create_dir_all(src.join("nested/empty")).unwrap();
+    fs::create_dir(dst.join("nested")).unwrap();
+    for n in 0..12 {
+        fs::write(
+            src.join("nested").join(format!("file-{n}")),
+            format!("content-{n}"),
+        )
+        .unwrap();
+    }
+    fs::write(src.join("zero"), b"").unwrap();
+    fs::write(dst.join("nested/file-0"), b"content-0").unwrap();
+    assert_success(dir_resume(&src, &dst, &state, &[]));
+    assert!(dst.join("nested/empty").is_dir());
+    for n in 0..12 {
+        assert_eq!(
+            fs::read(src.join("nested").join(format!("file-{n}"))).unwrap(),
+            fs::read(dst.join("nested").join(format!("file-{n}"))).unwrap()
+        );
+    }
+    assert_eq!(fs::read(dst.join("zero")).unwrap(), b"");
+    assert!(state.join("plan.v1").is_file());
+    assert!(state.join("journal.v1").is_file());
+    assert_success(dir_resume(&src, &dst, &state, &[]));
+    assert_eq!(fs::read(dst.join("nested/file-0")).unwrap(), b"content-0");
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_dir_resumes_a_valid_partial_and_rejects_corrupt_prefix() {
+    let (_tmp, src, dst, state) = make_directory_resume_fixture();
+    fs::create_dir(src.join("nested")).unwrap();
+    fs::create_dir(dst.join("nested")).unwrap();
+    let source = src.join("nested/large");
+    let target = dst.join("nested/large");
+    let body = vec![0x41; 2 * 1024 * 1024 + 13];
+    fs::write(&source, &body).unwrap();
+    let partial = seed_resume_partial(&source, &target, 1024 * 1024 + 11);
+    assert_success(dir_resume(&src, &dst, &state, &[]));
+    assert_eq!(fs::read(&target).unwrap(), body);
+    assert!(!partial.exists());
+    assert_success(dir_resume(&src, &dst, &state, &[]));
+
+    let (_tmp, src, dst, state) = make_directory_resume_fixture();
+    fs::write(src.join("file"), b"original data").unwrap();
+    let part = seed_resume_partial(&src.join("file"), &dst.join("file"), 8);
+    fs::write(&part, b"tampered").unwrap();
+    let output = dir_resume(&src, &dst, &state, &[]);
+    assert_error(output);
+    assert!(!dst.join("file").exists());
+    assert_eq!(fs::read(&part).unwrap(), b"tampered");
+    assert_eq!(fs::read(src.join("file")).unwrap(), b"original data");
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_dir_refuses_modified_completed_files_and_disappearing_targets() {
+    let (_tmp, src, dst, state) = make_directory_resume_fixture();
+    fs::write(src.join("one"), b"one").unwrap();
+    fs::write(src.join("two"), b"two").unwrap();
+    assert_success(dir_resume(&src, &dst, &state, &[]));
+    fs::write(dst.join("one"), b"BAD").unwrap();
+    assert_error(dir_resume(&src, &dst, &state, &[]));
+    assert_eq!(fs::read(src.join("one")).unwrap(), b"one");
+    fs::write(dst.join("one"), b"one").unwrap();
+    assert_success(dir_resume(&src, &dst, &state, &[]));
+    fs::remove_file(dst.join("two")).unwrap();
+    assert_error(dir_resume(&src, &dst, &state, &[]));
+    assert!(!dst.join("two").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_dir_rejects_source_edits_unsupported_flags_and_symlinks() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, src, dst, state) = make_directory_resume_fixture();
+    fs::write(src.join("one"), b"one").unwrap();
+    for args in [
+        &["--move"][..],
+        &["--overwrite"],
+        &["--count", "2"],
+        &["-N"],
+        &["--hash", "sha256"],
+        &["--allow-nonatomic-publish"],
+        &["-O"],
+        &["--dry-run"],
+        &["--preserve-times"],
+    ] {
+        assert_error(dir_resume(&src, &dst, &state, args));
+    }
+    assert!(!state.join("plan.v1").exists());
+    assert_success(dir_resume(&src, &dst, &state, &[]));
+    fs::write(src.join("one"), b"changed").unwrap();
+    assert_error(dir_resume(&src, &dst, &state, &[]));
+    assert_eq!(fs::read(dst.join("one")).unwrap(), b"one");
+
+    let (_tmp, src, dst, state) = make_directory_resume_fixture();
+    symlink("/tmp", src.join("bad-link")).unwrap();
+    assert_error(dir_resume(&src, &dst, &state, &[]));
+    assert!(!state.join("lock.v1").exists());
+    assert!(!dst.join("bad-link").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_dir_private_state_and_competing_process_lock() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let (_tmp, src, dst, state) = make_directory_resume_fixture();
+    fs::write(src.join("one"), b"hello").unwrap();
+    assert_success(dir_resume(&src, &dst, &state, &[]));
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_error(dir_resume(&src, &dst, &state, &[]));
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.join("lock.v1"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert_error(dir_resume(&src, &dst, &state, &[]));
+    drop(lock);
+    assert_success(dir_resume(&src, &dst, &state, &[]));
+
+    let (_tmp, src, dst, state) = make_directory_resume_fixture();
+    fs::write(src.join("one"), b"test").unwrap();
+    let state_link = state.parent().unwrap().join("state-link");
+    symlink(&state, &state_link).unwrap();
+    assert_error(dir_resume(&src, &dst, &state_link, &[]));
+    assert!(!state.join("plan.v1").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_dir_recovers_from_crash_after_atomic_publish_before_checkpoint() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, src, dst, state) = make_directory_resume_fixture();
+    fs::write(src.join("one"), b"already published").unwrap();
+    let part = seed_resume_partial(
+        &src.join("one"),
+        &dst.join("one"),
+        b"already published".len(),
+    );
+    let (_, lock, manifest) = resume_fixture_paths(&src.join("one"), &dst.join("one"));
+    fs::write(&lock, b"").unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(manifest.is_file());
+    // Simulates a crash after no-replace rename but before journal append,
+    // manifest cleanup or chmod. Test setup is isolated; production uses
+    // descriptor-relative renameat2 / renameatx_np.
+    fs::rename(&part, dst.join("one")).unwrap();
+    assert_eq!(
+        fs::metadata(dst.join("one")).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_success(dir_resume(&src, &dst, &state, &[]));
+    assert_eq!(fs::read(dst.join("one")).unwrap(), b"already published");
+    assert_eq!(
+        fs::metadata(dst.join("one")).unwrap().permissions().mode() & 0o777,
+        fs::metadata(src.join("one")).unwrap().permissions().mode() & 0o777
+    );
+    assert!(
+        !manifest.exists(),
+        "orphan manifest must be removed after verified recovery"
+    );
+    assert!(state.join("journal.v1").is_file());
+    assert_success(dir_resume(&src, &dst, &state, &[]));
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_dir_writer_rejects_symlinked_partial_without_touching_victim() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, src, dst, state) = make_directory_resume_fixture();
+    fs::write(src.join("one"), b"protected").unwrap();
+    let part = seed_resume_partial(&src.join("one"), &dst.join("one"), 4);
+    let victim = src.parent().unwrap().join("victim");
+    fs::write(&victim, b"must remain intact").unwrap();
+    fs::remove_file(&part).unwrap();
+    symlink(&victim, &part).unwrap();
+    assert_error(dir_resume(&src, &dst, &state, &[]));
+    assert_eq!(fs::read(victim).unwrap(), b"must remain intact");
+    assert!(!dst.join("one").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_dir_per_file_lock_refuses_a_competing_writer() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, src, dst, state) = make_directory_resume_fixture();
+    fs::write(src.join("one"), b"lock-protected").unwrap();
+    let _part = seed_resume_partial(&src.join("one"), &dst.join("one"), 3);
+    let (_part_path, lock_path, _meta_path) =
+        resume_fixture_paths(&src.join("one"), &dst.join("one"));
+    fs::write(&lock_path, b"").unwrap();
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert_error(dir_resume(&src, &dst, &state, &[]));
+    assert!(!dst.join("one").exists());
+    drop(lock);
+    assert_success(dir_resume(&src, &dst, &state, &[]));
+    assert_eq!(fs::read(dst.join("one")).unwrap(), b"lock-protected");
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_dir_tampered_orphan_manifest_fails_without_modifying_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, src, dst, state) = make_directory_resume_fixture();
+    fs::write(src.join("one"), b"original").unwrap();
+    let part = seed_resume_partial(&src.join("one"), &dst.join("one"), 8);
+    let (_, lock, manifest) = resume_fixture_paths(&src.join("one"), &dst.join("one"));
+    fs::write(&lock, b"").unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::rename(part, dst.join("one")).unwrap();
+    fs::write(&manifest, b"invalid original identity").unwrap();
+    assert_error(dir_resume(&src, &dst, &state, &[]));
+    assert_eq!(fs::read(dst.join("one")).unwrap(), b"original");
+    assert_eq!(fs::read(src.join("one")).unwrap(), b"original");
+    assert_eq!(
+        fs::metadata(dst.join("one")).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(fs::read(manifest).unwrap(), b"invalid original identity");
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_dir_rejects_ambiguous_names_before_creating_state_or_targets() {
+    for (first, second) in [("Film", "film"), ("Café", "Cafe\u{301}")] {
+        let (_tmp, src, dst, state) = make_directory_resume_fixture();
+        fs::create_dir(src.join(first)).unwrap();
+        if src.join(second).exists() {
+            // This filesystem already treats both spellings as the same entry.
+            continue;
+        }
+        fs::write(src.join(second), b"file").unwrap();
+        let run = dir_resume(&src, &dst, &state, &[]);
+        assert!(String::from_utf8_lossy(&run.stderr).contains("ambiguous"));
+        assert_error(run);
+        assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&dst).unwrap().count(), 0);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_directory_resume_refuses_before_creating_target_or_state() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("source");
+    let dst = tmp.path().join("destination");
+    let state = tmp.path().join("state");
+    for directory in [&src, &dst, &state] {
+        fs::create_dir(directory).unwrap();
+    }
+    write(&src.join("file"), "source data");
+    let run = mch(&[
+        "--quiet",
+        "--resume-dir",
+        "--resume-dir-state",
+        state.to_str().unwrap(),
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]);
+    assert!(String::from_utf8_lossy(&run.stderr).contains("only on Unix"));
+    assert_error(run);
+    assert_eq!(fs::read_dir(&dst).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+    assert_eq!(fs::read(src.join("file")).unwrap(), b"source data");
+}
+
+#[test]
+fn progress_interval_and_hash_eta_follow_verification_mode() {
+    let t = TempDir::new().unwrap();
+    let src = t.path().join("src");
+    write(&src, "bytes");
+    let dst = t.path().join("dst");
+    let bad = mch(&[
+        "--progress-interval-ms",
+        "0",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]);
+    assert_error(bad);
+    assert!(!dst.exists());
+    for (name, skip) in [("verified", false), ("unchecked", true)] {
+        let dst = t.path().join(name);
+        let mut args = vec!["--progress", "always", "--progress-interval-ms", "50"];
+        if skip {
+            args.push("--no-hash");
+        }
+        args.extend([src.to_str().unwrap(), dst.to_str().unwrap()]);
+        let run = mch(&args);
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr).contains("copy + hash ETA 0s"),
+            !skip
+        );
+        assert_success(run);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn linux_tree_options_refuse_before_writes_on_other_platforms() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let dst = tmp.path().join("destination");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&state).unwrap();
+    write(&src.join("data"), "kept");
+    for flag in ["--transaction", "--snapshot-in"] {
+        let run = mch(&[
+            flag,
+            state.to_str().unwrap(),
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+        ]);
+        assert!(String::from_utf8_lossy(&run.stderr).contains("require Linux"));
+        assert_error(run);
+        assert!(!dst.exists());
+        assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn ordinary_sparse_copy_preserves_mixed_data_and_trailing_holes() {
+    use std::io::{Seek, SeekFrom, Write};
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("sparse-input");
+    let dst = tmp.path().join("sparse-output");
+    let mut file = fs::File::create(&src).unwrap();
+    file.write_all(b"prefix").unwrap();
+    file.seek(SeekFrom::Start((3 << 20) + 123)).unwrap();
+    file.write_all(b"middle").unwrap();
+    file.set_len((8 << 20) + 37).unwrap();
+    drop(file);
+    assert_success(mch(&[
+        "--sparse",
+        "--progress",
+        "always",
+        src.to_str().unwrap(),
+        dst.to_str().unwrap(),
+    ]));
+    assert_eq!(fs::read(&src).unwrap(), fs::read(&dst).unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let source = fs::metadata(&src).unwrap();
+        if source.blocks() * 512 < source.len() / 2 {
+            let target = fs::metadata(&dst).unwrap();
+            assert!(target.blocks() * 512 < target.len() / 2);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
+        assert_ne!(
+            fs::metadata(&dst).unwrap().file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE,
+            0
+        );
+    }
+}
+
+#[test]
+fn transaction_refuses_access_time_preservation_before_writing() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source");
+    let state = temp.path().join("state");
+    let target = temp.path().join("target");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&state).unwrap();
+    write(&source.join("input"), "unchanged");
+    let result = mch(&[
+        "--transaction",
+        state.to_str().unwrap(),
+        "--preserve-times",
+        source.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert_error(result.clone());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(error.contains("--preserve-times") && error.contains("--transaction"));
+    assert!(!target.exists());
+    assert_eq!(fs::read_dir(state).unwrap().count(), 0);
+}

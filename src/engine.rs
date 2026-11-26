@@ -263,7 +263,7 @@ fn existing_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
 }
 
 // Resolve existing ancestors (including symbolic links), while keeping future path components.
-fn intended_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn intended_path(path: &Path) -> Result<PathBuf> {
     let mut base = absolute(path)?;
     let mut suffix = Vec::<OsString>::new();
     while existing_metadata(&base)?.is_none() {
@@ -471,7 +471,7 @@ fn collect_directory(plan: &mut Plan, source: &Path, destination: &Path) -> Resu
 
 // Preserve opaque OS filename bytes. Only valid Unicode spans participate
 // in normalization, including when a different component is not UTF-8.
-fn folded_destination_key(path: &Path) -> Vec<u8> {
+pub(crate) fn folded_destination_key(path: &Path) -> Vec<u8> {
     let bytes = path.as_os_str().as_encoded_bytes();
     let mut key = Vec::with_capacity(bytes.len());
     for chunk in bytes.utf8_chunks() {
@@ -1043,7 +1043,9 @@ fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Resu
             let mut source = fs::File::open(&task.source)
                 .with_context(|| format!("open source {}", task.source.display()))?;
             let original_permissions = source.metadata()?.permissions();
-            if let Some(progress) = progress {
+            if cli.sparse {
+                crate::sparse::copy(&mut source, &mut staged, progress)?;
+            } else if let Some(progress) = progress {
                 let mut buffer = vec![0_u8; 1024 * 1024];
                 loop {
                     let size = loop {
@@ -1075,8 +1077,10 @@ fn process_file(cli: &Cli, task: &FileTask, progress: Option<&Progress>) -> Resu
             drop(source);
 
             if !cli.no_hash {
-                let original_hash = hash_file(&task.source, cli.hash)?;
-                let staged_hash = hash_file(&temporary.0, cli.hash)?;
+                let original_hash =
+                    crate::hashing::hash_file_counted(&task.source, cli.hash, progress)?;
+                let staged_hash =
+                    crate::hashing::hash_file_counted(&temporary.0, cli.hash, progress)?;
                 if original_hash != staged_hash {
                     bail!(
                         "{} verification FAILED for {} -> {}",
@@ -1536,7 +1540,13 @@ pub(crate) fn execute(cli: &Cli, plan: &Plan) -> Result<()> {
         let (sender, receiver) = std::sync::mpsc::channel::<bool>();
         let reporter = if show_progress {
             let tracker_ref = &tracker;
-            Some(scope.spawn(move || crate::progress::watch(tracker_ref, receiver)))
+            Some(scope.spawn(move || {
+                crate::progress::watch(
+                    tracker_ref,
+                    receiver,
+                    std::time::Duration::from_millis(cli.progress_interval_ms),
+                )
+            }))
         } else {
             None
         };

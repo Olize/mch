@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) struct Progress {
     copied: AtomicU64,
+    hashed: AtomicU64,
     finished: AtomicU64,
     total_bytes: u64,
     total_files: u64,
@@ -18,6 +19,7 @@ impl Progress {
     pub(crate) fn new(total_bytes: u64, total_files: u64, hash_verification: bool) -> Self {
         Self {
             copied: AtomicU64::new(0),
+            hashed: AtomicU64::new(0),
             finished: AtomicU64::new(0),
             total_bytes,
             total_files,
@@ -28,6 +30,10 @@ impl Progress {
 
     pub(crate) fn add_bytes(&self, bytes: u64) {
         self.copied.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_hashed(&self, bytes: u64) {
+        self.hashed.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn file_finished(&self) {
@@ -60,6 +66,21 @@ impl Progress {
         } else {
             String::from("unknown")
         };
+        // Work includes one transfer plus two full independent hash reads.
+        let verified_eta = if self.hash_verification {
+            let work = u128::from(copied) + u128::from(self.hashed.load(Ordering::Relaxed));
+            let total = u128::from(self.total_bytes) * 3;
+            let estimate = match successful {
+                Some(true) => "0s".to_owned(),
+                None if work > 0 && work < total => {
+                    format_duration(((total - work) as f64 * elapsed / work as f64).ceil() as u64)
+                }
+                _ => "unknown".to_owned(),
+            };
+            format!(" | copy + hash ETA {estimate}")
+        } else {
+            String::new()
+        };
         let state = match successful {
             Some(true) if self.hash_verification => "COPY VERIFIED",
             Some(true) => "COPY COMPLETE (NO HASH VERIFICATION)",
@@ -74,7 +95,7 @@ impl Progress {
             None => "COPYING",
         };
         eprintln!(
-            "PROGRESS {state}: {percent:.1}% | {} / {} copied | {finished}/{} files | {}/s | copy ETA {eta}",
+            "PROGRESS {state}: {percent:.1}% | {} / {} copied | {finished}/{} files | {}/s | copy ETA {eta}{verified_eta}",
             human_bytes(copied),
             human_bytes(self.total_bytes),
             self.total_files,
@@ -112,9 +133,9 @@ fn format_duration(seconds: u64) -> String {
 
 // Called on a scoped thread. Stop immediately when the copy completes;
 // don't wait for the reporting interval before returning to the CLI.
-pub(crate) fn watch(progress: &Progress, receiver: Receiver<bool>) {
+pub(crate) fn watch(progress: &Progress, receiver: Receiver<bool>, interval: Duration) {
     loop {
-        match receiver.recv_timeout(Duration::from_secs(1)) {
+        match receiver.recv_timeout(interval) {
             Ok(success) => {
                 progress.snapshot(Some(success));
                 break;
