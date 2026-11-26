@@ -47,6 +47,7 @@ try {
     }
     & $directoryProbe -Binary (Join-Path $out 'release\mch.exe') -Root ([IO.Path]::GetPathRoot($ExfatRoot)) -Format 'exFAT'
     & $directoryProbe -Binary (Join-Path $out 'release\mch.exe') -Root ([IO.Path]::GetPathRoot($Fat32Root)) -Format 'FAT32'
+    & .\scripts\test-windows-resume.ps1 -Binary (Join-Path $out 'release\mch.exe') -ExfatRoot $ExfatRoot -Fat32Root $Fat32Root
     Write-Output "MCH_WINDOWS_PASS"
 } finally {
     Pop-Location

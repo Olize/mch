@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 — 2026-11-26
+
+- Resume interrupted Windows NTFS directory copies and verify completed files, their identities and empty directories on restart.
+- Stop before modifying a Windows directory job if a torn journal record cannot identify its staged object.
+- Add native single-file resume for local Windows NTFS copies to a new destination, with prefix verification and an owner-only staging file.
+
 ## 0.3.0 — 2026-11-26
 
 - Add verified Unix directory resume and sparse-file copies on supported Unix and Windows filesystems.

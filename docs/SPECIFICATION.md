@@ -1,4 +1,4 @@
-# Technical specification — MCH 0.3.0
+# Technical specification — MCH 0.4.0
 
 Status: implementation contract, not a formal safety proof.
 
@@ -23,7 +23,7 @@ Supports regular files, directory trees and Unix symlinks; does not copy sockets
 - --no-color: disable ANSI colors.
 - --progress auto|always|never: no-ANSI line-oriented status to stderr; auto only with a terminal, quiet and dry-run suppress progress.
 - --preserve-times: opt-in snapshot and restoration of access/modified timestamps for copied files and newly created destination directories; Unix symlink timestamps are preserved on the link itself.
-- --resume: opt-in Unix single-regular-file resume with prefix checking and compulsory full hash verification. Refuses no-hash (-N), --count other than 1, -O, multiple sources and non-regular inputs; not yet available on Windows.
+- --resume: opt-in Unix single-regular-file resume with prefix checking and compulsory full hash verification. Refuses no-hash (-N), --count other than 1, -O, multiple sources and non-regular inputs; Windows supports single-file resume only on local NTFS, into an existing directory, as a copy to a new name.
 - -v: version, -h: help.
 
 ## Copy/verification process
@@ -44,7 +44,7 @@ Preflight errors must leave originals untouched. Failures in the copy phase reta
 - The progress reporter separates already verified/reused bytes from new transfer bytes; copy ETA only estimates transfer.
 - After successful independent verification and metadata application, the stage is renamed to its destination. The source is removed only after success when --move is selected.
 - A kill/power interruption can leave incomplete staging and metadata. A mismatched or missing metadata pair is a deliberate hard error, not silently reset. The source/destination filesystem must provide safe regular-file and rename semantics.
-- This does **not** defend against hostile races or a same-inode/same-size/same-mtime content mutation, cannot guarantee directory durability on power loss, and does not resume directory trees, multiple files or Windows copies.
+- This does **not** defend against hostile races or a same-inode/same-size/same-mtime content mutation, cannot guarantee directory durability on power loss, and does not resume directory trees or multiple files.
 
 ## v0.2.1 security patch
 
@@ -86,3 +86,15 @@ On Linux Btrfs, `--snapshot-in DIR` creates a read-only subvolume named after th
 ## Release gates
 
 cargo fmt --check; cargo clippy --locked --all-targets -- -D warnings; cargo test --locked; cargo build --release --locked. Test matrix: Linux, macOS, Windows. The integration tests verify both successful workflows and safety refusals.
+
+### Windows single-file resume
+
+The Windows backend holds an exclusive current-user manifest and staging file. Both require a protected owner-only DACL and a single link. Reopening validates the source file ID, volume, length and modification time. MCH compares every saved byte and independently hashes both open files before publishing through the staging handle. A new destination uses the owner-only staging ACL. This single-file mode excludes network shares, reparse points, move and overwrite. An incomplete manifest requires inspection. Keep both files after an error.
+
+### Windows directory resume
+
+Use one stable local NTFS source tree and two separate existing directories for the destination and state. The latter two must be on the same NTFS volume and initially empty. Source, destination and state must be disjoint. MCH creates a protected current-user workspace inside the state directory. Keep it for the lifetime of the job. The copier accepts ordinary single-link files and directories and checks for case and Unicode name collisions. The transfer is copy-only with one worker and BLAKE3.
+
+MCH binds the source and destination identities, relative names, source file sizes, modification times and full content hashes to the saved plan. Before publishing any entry it records the staged object's NTFS identity and synchronizes that record. Publication renames the open staged file or directory without replacing existing targets. Restart checks the recorded identity and hashes already published files. The active partial file is compared byte for byte against its source. MCH can complete a short final journal record when it contains the whole 24-byte NTFS identity and every saved byte matches the staged object. If only 1–23 bytes survive, MCH stops before changing the journal, stage or published files. Keep the interrupted job for inspection and start a new copy using fresh, empty destination and state directories. A final source and destination walk verifies the complete tree. The journal remains available for another verification run.
+
+Concurrent MCH directory jobs targeting the same root are serialized by refusing a second active job. Use operator-controlled trees and state. Physical power-loss recovery is unverified. The mode copies main file contents and the directory structure, including empty directories. It does not preserve source ACLs or alternate data streams. Published entries retain owner-only access.
